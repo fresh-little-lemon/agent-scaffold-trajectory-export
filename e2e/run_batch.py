@@ -12,13 +12,17 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import itertools
 import json
 import logging
 import os
+import shlex
 import shutil
 import signal
+import socket
 import subprocess
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
@@ -49,26 +53,30 @@ def _query_vllm_tokens(base_url: str) -> dict | None:
     except Exception:
         return None
 
-# Graceful stop: send SIGUSR1 to stop dispatching and kill THIS batch's containers.
+# Graceful stop: send SIGUSR1 to stop dispatching and stop THIS batch's containers.
 _stop_event = threading.Event()
+DOCKER_STOP_TIMEOUT = 30  # seconds between SIGTERM and SIGKILL in `docker stop`
 
 def _handle_stop_signal(signum, frame):
-    log.warning(f"Received signal {signum}, stopping dispatch and killing containers (label={_BATCH_LABEL})...")
+    log.warning(f"Received signal {signum}, stopping dispatch and stopping containers (label={_BATCH_LABEL})...")
     _stop_event.set()
     threading.Thread(target=_kill_own_containers, daemon=True).start()
 
-def _kill_own_containers():
-    """Kill only containers belonging to this batch (matched by label)."""
+def _kill_own_containers(extra_filter: str = ""):
+    """Stop (SIGTERM, then SIGKILL after DOCKER_STOP_TIMEOUT s) only this batch's containers."""
     result = subprocess.run(
-        f"docker ps --filter label={_BATCH_LABEL} -q | xargs -r -P10 docker kill",
+        f"docker ps --filter label={_BATCH_LABEL} {extra_filter} -q "
+        f"| xargs -r -n1 -P20 docker stop -t {DOCKER_STOP_TIMEOUT}",
         shell=True, capture_output=True, text=True,
     )
-    killed = result.stdout.strip().splitlines()
-    if killed:
-        log.info(f"Killed {len(killed)} containers (label={_BATCH_LABEL})")
+    stopped = result.stdout.strip().splitlines()
+    if stopped:
+        log.info(f"Stopped {len(stopped)} containers (label={_BATCH_LABEL} {extra_filter})".rstrip())
 
-signal.signal(signal.SIGTERM, _handle_stop_signal)
-signal.signal(signal.SIGUSR1, _handle_stop_signal)
+def _install_signal_handlers():
+    signal.signal(signal.SIGTERM, _handle_stop_signal)
+    if hasattr(signal, "SIGUSR1"):
+        signal.signal(signal.SIGUSR1, _handle_stop_signal)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -197,33 +205,33 @@ def seed_workspace(run_home: Path, scaffolding: str, image: str = "eval-base"):
     ], capture_output=True)
 
 
-def fix_permissions(run_home: Path, image: str = "eval-base"):
-    """Make all files in run_home world-readable so host root can access."""
+def fix_permissions(paths, image: str = "eval-base"):
+    """Make all files under the given host dirs world-readable so host root can access."""
+    if isinstance(paths, (str, Path)):
+        paths = [paths]
+    paths = [Path(p) for p in paths if Path(p).exists()]
+    if not paths:
+        return
+    mounts = []
+    for i, p in enumerate(paths):
+        mounts += ["-v", f"{p}:/mnt/h{i}"]
     subprocess.run([
         "docker", "run", "--rm", "--user", "root",
         "--label", _BATCH_LABEL,
-        "-v", f"{run_home}:/mnt/h",
-        image, "bash", "-c", "chmod -R 777 /mnt/h 2>/dev/null; true",
+        *mounts,
+        image, "bash", "-c", "chmod -R 777 /mnt/h* 2>/dev/null; true",
     ], capture_output=True)
 
 
 def _archive_failed(html_id: str, tried_cnt: int, workspace_dir: Path,
                     scores_dir: Path, model_out_dir: Path):
-    """Move stale workspace/traces/progress to {model_out_dir}/failed/{html_id}-tried-{cnt}/."""
-    failed_dir = model_out_dir / "failed" / f"{html_id}-tried-{tried_cnt}"
-    failed_dir.mkdir(parents=True, exist_ok=True)
-    ws = workspace_dir / html_id
-    if ws.exists():
-        shutil.move(str(ws), str(failed_dir / "workspace"))
-    traces_dir = model_out_dir / "traces"
-    trace = traces_dir / f"{html_id}.jsonl"
-    if trace.exists():
-        (failed_dir / "traces").mkdir(exist_ok=True)
-        shutil.move(str(trace), str(failed_dir / "traces" / f"{html_id}.jsonl"))
-    progress = scores_dir / ".progress" / f"{html_id}.json"
-    if progress.exists():
-        (failed_dir / "progress").mkdir(exist_ok=True)
-        shutil.move(str(progress), str(failed_dir / "progress" / f"{html_id}.json"))
+    """Move a failed attempt (workspace + per-item root) into attempts/{html_id}/{UTC ts}/.
+
+    Nothing is deleted; see move_to_attempts. scores_dir is unused (kept for call compatibility).
+    """
+    move_to_attempts(model_out_dir, html_id, workspace_dir / html_id,
+                     item_root_dir(model_out_dir, html_id),
+                     reason=f"retry_round_{tried_cnt}")
 
 
 IMAGE_MAP = {
@@ -236,6 +244,418 @@ IMAGE_MAP = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Pure helpers (unit-tested in tests/test_run_batch_helpers.py)
+# ---------------------------------------------------------------------------
+
+PROXY_READY_TIMEOUT = 15  # seconds to wait for the in-container capture proxy
+PROXY_NOT_READY_MARKER = "[run_batch] PROXY_NOT_READY"
+PROXY_NOT_READY_EXIT = 97
+
+# Claude Code env defaults (claude_code scaffold only). Override/omit per key via
+# run config "claude_env" (a value of null removes the variable).
+# CLAUDE_CODE_ATTRIBUTION_HEADER=0: the attribution/billing header is a per-request
+# system block that the transcript does not store; with it off, every request's
+# system prompt is reconstructible from the transcript.
+CLAUDE_CODE_DEFAULT_ENV = {
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+    "DISABLE_TELEMETRY": "1",
+    "DISABLE_ERROR_REPORTING": "1",
+    "DISABLE_AUTOUPDATER": "1",
+    "CLAUDE_CODE_ATTRIBUTION_HEADER": "0",
+}
+
+_SECRET_KEY_PARTS = ("key", "token", "secret", "password")
+MASKED = "***MASKED***"
+
+
+def utc_stamp(t: float | None = None) -> str:
+    """Filesystem-safe UTC timestamp, e.g. 20261026T101530Z."""
+    return time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(time.time() if t is None else t))
+
+
+def _is_secret_key(key) -> bool:
+    k = str(key).lower()
+    return any(part in k for part in _SECRET_KEY_PARTS)
+
+
+def mask_secrets(obj):
+    """Recursively mask string values whose key contains key/token/secret/password.
+
+    The literal "EMPTY" and non-string values (ints, bools, None) are kept.
+    """
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            if _is_secret_key(k) and isinstance(v, str) and v != "EMPTY" and v != "":
+                out[k] = MASKED
+            else:
+                out[k] = mask_secrets(v)
+        return out
+    if isinstance(obj, list):
+        return [mask_secrets(v) for v in obj]
+    return obj
+
+
+def merge_env(base: dict, overrides: dict | None) -> dict:
+    """Merge overrides on top of base; a None value removes the key. Values become str."""
+    env = dict(base)
+    for k, v in (overrides or {}).items():
+        if v is None:
+            env.pop(k, None)
+        elif isinstance(v, bool):
+            env[k] = "1" if v else "0"
+        else:
+            env[k] = str(v)
+    return env
+
+
+def env_args(env: dict) -> list:
+    """{"A": "1", "B": ""} -> ["-e", "A=1", "-e", "B="]."""
+    out = []
+    for k, v in env.items():
+        out += ["-e", f"{k}={v}"]
+    return out
+
+
+def build_common_env(model_cfg: dict, claude_debug: bool = False, enable_tasks: bool = False) -> dict:
+    """Env every scaffold's container gets (the -e flags before the per-scaffold block)."""
+    env = {
+        "http_proxy": "", "https_proxy": "",
+        "HTTP_PROXY": "", "HTTPS_PROXY": "",
+        "all_proxy": "", "ALL_PROXY": "",
+        "HOME": "/home/node",
+        "PLAYWRIGHT_BROWSERS_PATH": "/home/node/.cache/ms-playwright",
+        # docker --init (tini) forwards signals to the whole process group, so
+        # `docker stop` reaches the agent and the proxy, not just PID-1 bash.
+        "TINI_KILL_PROCESS_GROUP": "1",
+    }
+    # Set context window for auto-compact if specified in model config
+    ctx_window = model_cfg.get("context_window")
+    if ctx_window:
+        env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(ctx_window)
+        env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] = "60"
+    # Claude Code verbose debug logging (writes to .claude/debug/)
+    if claude_debug:
+        env["CLAUDE_CODE_DEBUG_LOG_LEVEL"] = "verbose"
+    # Task tools change agent behavior, so they are opt-in separately from debug logging
+    if enable_tasks:
+        env["CLAUDE_CODE_ENABLE_TASKS"] = "1"
+    return env
+
+
+def build_claude_code_env(model: str, api_key: str, api_base: str,
+                          overrides: dict | None = None) -> dict:
+    """Env specific to the claude_code scaffold, with run config claude_env merged on top."""
+    # Map all Claude Code model aliases to the actual model name
+    env = {
+        "ANTHROPIC_API_KEY": api_key,
+        "ANTHROPIC_BASE_URL": api_base,
+        "ANTHROPIC_MODEL": model,
+        "ANTHROPIC_SMALL_FAST_MODEL": model,
+        "ANTHROPIC_DEFAULT_SONNET_MODEL": model,
+        "ANTHROPIC_DEFAULT_OPUS_MODEL": model,
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL": model,
+        "API_TIMEOUT_MS": "600000",
+        **CLAUDE_CODE_DEFAULT_ENV,
+    }
+    return merge_env(env, overrides)
+
+
+def item_root_dir(model_out_dir: Path, html_id: str) -> Path:
+    """Host root of one item: {output_base}/{scaffolding}/{model}/items/{html_id}."""
+    return Path(model_out_dir) / "items" / str(html_id)
+
+
+def build_output_mount(item_root: Path, scaffolding: str, model: str) -> list:
+    """Mount only this item's root at the in-container model dir (no access to other items)."""
+    return ["-v", f"{item_root}:/app/outputs/{scaffolding}/{model}"]
+
+
+def build_mounts(*, run_home: Path, html_id: str, rubric_view: Path, item_root: Path,
+                 scaffolding: str, model: str, prompt_file: Path, review_mcp_file: Path,
+                 score_mcp_file: Path, proxy_script: Path, score_server_script: Path,
+                 htmls_dir: Path, contexts_dir: Path) -> list:
+    """Docker -w/-v args shared by all scaffolds."""
+    return [
+        "-v", f"{run_home}:/home/node",
+        "-w", "/home/node",
+        "-v", "eval-interact-review-pw-cache:/home/node/.cache/ms-playwright",
+        "-v", f"{htmls_dir}/{html_id}.html:/data/resources/htmls/{html_id}.html:ro",
+        "-v", f"{contexts_dir}/{html_id}.json:/data/resources/contexts/{html_id}.json:ro",
+        "-v", f"{rubric_view}:/data/rubrics:ro",
+        *build_output_mount(item_root, scaffolding, model),
+        "-v", f"{prompt_file}:/tmp/prompt.md:ro",
+        "-v", f"{review_mcp_file}:/tmp/review_mcp.json:ro",
+        "-v", f"{score_mcp_file}:/tmp/score_mcp.json:ro",
+        "-v", f"{proxy_script}:/opt/api_proxy.py:ro",
+        "-v", f"{score_server_script}:/opt/review/score_server.py:ro",
+    ]
+
+
+def build_proxy_start(scaffolding: str, model: str, html_id: str, upstream: str,
+                      port: int = IN_CONTAINER_PROXY_PORT,
+                      ready_timeout: int = PROXY_READY_TIMEOUT) -> str:
+    """Bash fragment: start the capture proxy, wait until it accepts TCP, else abort.
+
+    If the proxy is not listening within ready_timeout s, a marker line is appended
+    to the proxy log and the container command exits PROXY_NOT_READY_EXIT, so the
+    agent never runs uncaptured.
+    """
+    out = f"/app/outputs/{scaffolding}/{model}"
+    trace_file = f"{out}/traces/{html_id}.jsonl"
+    proxy_log = f"{out}/traces/log/{html_id}.proxy.log"
+    tries = max(1, int(ready_timeout * 4))
+    wait_py = (
+        "import socket,sys,time; "
+        f"ok=any(socket.socket().connect_ex(('127.0.0.1',{port}))==0 or time.sleep(0.25) "
+        f"for _ in range({tries})); sys.exit(0 if ok else 1)"
+    )
+    marker = f"{PROXY_NOT_READY_MARKER} port={port} after {ready_timeout}s; refusing to run agent uncaptured"
+    return (
+        f"mkdir -p {out}/traces/log && "
+        f"{{ UPSTREAM={upstream} TRACE_FILE={trace_file} "
+        f"python3 /opt/api_proxy.py {port} > /tmp/proxy.log 2>{proxy_log} & }} && "
+        f"python3 -c \"{wait_py}\" || "
+        f"{{ echo \"{marker}\" >> {proxy_log} ; echo \"{marker}\" >&2 ; exit {PROXY_NOT_READY_EXIT} ; }} ; "
+    )
+
+
+def classify_end(timed_out: bool, stop_requested: bool) -> str:
+    """How a container run ended, for the per-item record."""
+    if timed_out:
+        return "timeout"
+    if stop_requested:
+        return "batch_stop"
+    return "exited"
+
+
+ARCHIVE_EXCLUDES = ("*.raw.jsonl", "*.reconstructed.jsonl")
+
+
+def build_archive_cmd(model_out_dir: Path, rels: list, dest: Path) -> str:
+    """bash pipeline packing rels (relative to model_out_dir) into a .tar.zst (originals kept)."""
+    excludes = " ".join(f"--exclude={shlex.quote(p)}" for p in ARCHIVE_EXCLUDES)
+    return (
+        f"set -o pipefail; tar -C {shlex.quote(str(model_out_dir))} {excludes} "
+        f"--ignore-failed-read -cf - {' '.join(shlex.quote(r) for r in rels)} "
+        f"| zstd -q -19 --long=27 -T4 -o {shlex.quote(str(dest))}"
+    )
+
+
+def unique_dir(base: Path) -> Path:
+    """base, or base-1, base-2, ... if it already exists."""
+    cand, n = base, 0
+    while cand.exists():
+        n += 1
+        cand = base.with_name(f"{base.name}-{n}")
+    return cand
+
+
+def image_version_tag(image: str) -> str | None:
+    """'repo/name:2.1.310' -> '2.1.310'; None if untagged."""
+    last = image.rsplit("/", 1)[-1]
+    return last.split(":", 1)[1] if ":" in last else None
+
+
+# ---------------------------------------------------------------------------
+# Host-side attempt / item bookkeeping
+# ---------------------------------------------------------------------------
+
+def move_to_attempts(model_out_dir: Path, html_id: str, run_home: Path, item_root: Path,
+                     reason: str = "") -> Path | None:
+    """Move a previous attempt's workspace and item root into attempts/{id}/{UTC ts}/.
+
+    Never deletes. Same-filesystem rename, so root-owned contents are fine.
+    """
+    if not run_home.exists() and not item_root.exists():
+        return None
+    dest = unique_dir(Path(model_out_dir) / "attempts" / str(html_id) / utc_stamp())
+    dest.mkdir(parents=True, exist_ok=True)
+    if run_home.exists():
+        shutil.move(str(run_home), str(dest / "workspace"))
+    if item_root.exists():
+        shutil.move(str(item_root), str(dest / "item"))
+    try:
+        (dest / "attempt_info.json").write_text(json.dumps(
+            {"html_id": html_id, "reason": reason, "moved_at": utc_stamp()}))
+    except OSError:
+        pass
+    log.info(f"[{html_id}] Previous attempt moved to {dest} ({reason})")
+    return dest
+
+
+def prepare_item_root(item_root: Path):
+    """Pre-create the item's in-container output dirs on the host with permissive modes."""
+    for sub in ("traces/log", "results/scores/.progress"):
+        (item_root / sub).mkdir(parents=True, exist_ok=True)
+    for p in (item_root, item_root / "traces", item_root / "traces" / "log",
+              item_root / "results", item_root / "results" / "scores",
+              item_root / "results" / "scores" / ".progress"):
+        try:
+            os.chmod(p, 0o777)
+        except OSError:
+            pass
+
+
+def sync_score_to_central(item_root: Path, central_scores_dir: Path, html_id: str) -> bool:
+    """Copy the item's final score into the central results/scores/ dir. True if it exists."""
+    src = item_root / "results" / "scores" / f"{html_id}.json"
+    if not src.exists():
+        return False
+    central_scores_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        shutil.copy2(src, central_scores_dir / f"{html_id}.json")
+    except OSError as e:
+        log.warning(f"[{html_id}] Could not copy score to {central_scores_dir}: {e}")
+    return True
+
+
+def archive_attempt(model_out_dir: Path, html_id: str):
+    """Pack workspace/{id} + items/{id} into archives/{id}/{UTC ts}.tar.zst (if zstd exists)."""
+    if not shutil.which("zstd"):
+        log.warning(f"[{html_id}] archive_attempts: zstd not on PATH, skipping archive")
+        return None
+    dest_dir = Path(model_out_dir) / "archives" / str(html_id)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / f"{utc_stamp()}.tar.zst"
+    n = 0
+    while dest.exists():
+        n += 1
+        dest = dest_dir / f"{utc_stamp()}-{n}.tar.zst"
+    rels = [r for r in (f"workspace/{html_id}", f"items/{html_id}")
+            if (Path(model_out_dir) / r).exists()]
+    if not rels:
+        return None
+    r = subprocess.run(["bash", "-c", build_archive_cmd(model_out_dir, rels, dest)],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        log.warning(f"[{html_id}] archive failed (exit={r.returncode}): {r.stderr[:300]}")
+        return None
+    log.info(f"[{html_id}] Archived attempt to {dest}")
+    return dest
+
+
+def proxy_not_ready(item_root: Path, html_id: str) -> bool:
+    plog = item_root / "traces" / "log" / f"{html_id}.proxy.log"
+    try:
+        return PROXY_NOT_READY_MARKER in plog.read_text(errors="replace")
+    except OSError:
+        return False
+
+
+def _finish_item(ctx: dict) -> bool:
+    """Host-side post-processing after an item's container exited. Returns has_score."""
+    fix_permissions([ctx["run_home"], ctx["item_root"]], ctx["image"])
+    has_score = sync_score_to_central(ctx["item_root"], ctx["scores_dir"], ctx["html_id"])
+    if ctx.get("archive_attempts"):
+        archive_attempt(ctx["out_dir"], ctx["html_id"])
+    return has_score
+
+
+# Timed-out items whose containers were left running: html_id -> ctx (incl. "proc").
+_timed_out = {}
+_timed_out_lock = threading.Lock()
+
+
+def finalize_timed_out(stop: bool = True) -> list:
+    """Stop (if asked) and reap containers that timed out, then post-process them.
+
+    Returns item_end records (exit_code / stopped_by) for batch_log.
+    """
+    with _timed_out_lock:
+        items = list(_timed_out.items())
+        _timed_out.clear()
+    records = []
+    for html_id, ctx in items:
+        proc = ctx["proc"]
+        stopped_by = "exited"
+        if proc.poll() is None:
+            if stop:
+                _kill_own_containers(f"--filter label=rb_item={html_id}")
+                stopped_by = "timeout"
+            try:
+                proc.wait(timeout=DOCKER_STOP_TIMEOUT + 60)
+            except subprocess.TimeoutExpired:
+                log.warning(f"[{html_id}] docker client still running after stop; leaving it")
+                with _timed_out_lock:
+                    _timed_out[html_id] = ctx
+                continue
+        has_score = _finish_item(ctx)
+        records.append({"event": "item_end", "html_id": html_id, "exit_code": proc.returncode,
+                        "stopped_by": stopped_by, "has_score": has_score,
+                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
+    return records
+
+
+# ---------------------------------------------------------------------------
+# Run manifest
+# ---------------------------------------------------------------------------
+
+def _cmd_out(cmd: list) -> str | None:
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        return r.stdout.strip() if r.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def _sha256_file(path: Path) -> str | None:
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def write_run_manifest(model_out_dir: Path, *, scaffolding: str, model_cfg: dict,
+                       model_config_path: Path, run_cfg: dict, effective_cfg: dict,
+                       claude_env: dict | None, capture: bool, claude_debug: bool,
+                       enable_tasks: bool) -> Path:
+    """Write manifests/{UTC ts}.json describing exactly what this batch runs."""
+    repo_root = Path(__file__).resolve().parent.parent
+    image = IMAGE_MAP.get(scaffolding, "eval-interact")
+    status = _cmd_out(["git", "-C", str(repo_root), "status", "--porcelain"])
+    try:
+        raw_model_cfg = json.loads(Path(model_config_path).read_text())
+    except Exception:
+        raw_model_cfg = dict(model_cfg)
+    manifest = {
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "hostname": socket.gethostname(),
+        "argv": list(sys.argv),
+        "repo": {
+            "root": str(repo_root),
+            "commit": _cmd_out(["git", "-C", str(repo_root), "rev-parse", "HEAD"]),
+            "dirty": (bool(status) if status is not None else None),
+        },
+        "scaffolding": scaffolding,
+        "docker_image": {
+            "name": image,
+            "id": _cmd_out(["docker", "image", "inspect", "--format", "{{.Id}}", image]),
+        },
+        "claude_code_version": image_version_tag(image) if scaffolding == "claude_code" else None,
+        "model_config_path": str(model_config_path),
+        "model_config": mask_secrets(raw_model_cfg),
+        "run_config": mask_secrets(run_cfg),
+        "effective_config": mask_secrets(effective_cfg),
+        "prompt_file": {"path": str(SKILL_FILE), "sha256": _sha256_file(SKILL_FILE)},
+    }
+    if scaffolding == "claude_code":
+        model = model_cfg["model_name"]
+        raw_base = model_cfg.get("anthropic_base_url") or model_cfg.get("openai_base_url", "http://127.0.0.1:8001")
+        upstream = raw_base.replace("127.0.0.1", "host.docker.internal").replace("localhost", "host.docker.internal")
+        api_base = f"http://127.0.0.1:{IN_CONTAINER_PROXY_PORT}" if capture else upstream
+        env = {**build_common_env(model_cfg, claude_debug, enable_tasks),
+               **build_claude_code_env(model, model_cfg["api_key"], api_base, claude_env)}
+        manifest["claude_code_container_env"] = mask_secrets(env)
+        manifest["capture_upstream"] = upstream if capture else None
+    dest_dir = Path(model_out_dir) / "manifests"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = unique_dir(dest_dir / f"{utc_stamp()}.json")
+    dest.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    return dest
+
+
 def run_single(
     html_id: str,
     scaffolding: str,
@@ -246,10 +666,27 @@ def run_single(
     container_timeout: int = 7200,
     debug: bool = False,
     claude_debug: bool = False,
+    *,
+    capture: bool = True,
+    enable_tasks: bool = False,
+    claude_env: dict | None = None,
+    archive_attempts: bool = False,
 ) -> dict:
+    """Run one item in its own container.
+
+    scores_dir is the central {model_out}/results/scores/ dir; the container only sees
+    its own item root ({model_out}/items/{html_id}/) mounted at /app/outputs/{scaffolding}/{model}.
+    `debug` no longer controls trace capture (see `capture`); it is kept for compatibility.
+    """
     model = model_cfg["model_name"]
-    score_file = scores_dir / f"{html_id}.json"
+    out_dir = output_base / scaffolding / model
+    item_root = item_root_dir(out_dir, html_id)
+    central_score_file = scores_dir / f"{html_id}.json"
+    score_file = item_root / "results" / "scores" / f"{html_id}.json"
+    if central_score_file.exists():
+        return {"html_id": html_id, "status": "skipped"}
     if score_file.exists():
+        sync_score_to_central(item_root, scores_dir, html_id)
         return {"html_id": html_id, "status": "skipped"}
 
     rubric_view = prepare_rubrics(html_id)
@@ -265,7 +702,7 @@ def run_single(
     run_home = workspace_dir / html_id
 
     # Scenario 2 (retry): workspace exists from a previously killed container
-    # but no score file → stale workspace, clean and re-seed
+    # but no score file → stale workspace; move it (and the item root) to attempts/ and re-seed
     if run_home.exists() and not score_file.exists():
         has_session = (
             (any((run_home / ".claude" / "projects").rglob("*.jsonl")) if (run_home / ".claude" / "projects").exists() else False)
@@ -273,17 +710,11 @@ def run_single(
             or (any((run_home / ".kimi" / "sessions").rglob("*")) if (run_home / ".kimi" / "sessions").exists() else False)
         )
         if has_session:
-            log.info(f"[{html_id}] Stale workspace (no score), cleaning for retry")
-            # Use docker to remove root-owned files (delete contents, not mount point)
-            subprocess.run([
-                "docker", "run", "--rm",
-                "-v", f"{run_home}:/target",
-                "alpine", "sh", "-c", "rm -rf /target/* /target/.[!.]* /target/..?*",
-            ], capture_output=True)
-            # Also try regular rmtree as fallback
-            shutil.rmtree(run_home, ignore_errors=True)
+            log.info(f"[{html_id}] Stale workspace (no score), moving to attempts/ for retry")
+            move_to_attempts(out_dir, html_id, run_home, item_root, reason="stale_workspace")
 
     run_home.mkdir(parents=True, exist_ok=True)
+    prepare_item_root(item_root)
     base_image = IMAGE_MAP.get(scaffolding, "eval-interact")
     seed_workspace(run_home, scaffolding, base_image)
 
@@ -324,49 +755,26 @@ def run_single(
     log.info(f"[{html_id}] Starting {scaffolding}/{model}")
     start = time.time()
 
-    # Pre-create traces/log dir on host (avoids permission issues inside container)
-    (output_base / scaffolding / model / "traces" / "log").mkdir(parents=True, exist_ok=True)
-
     host_uid_gid = f"{os.getuid()}:{os.getgid()}"
 
+    # --init: tini is PID 1 (bash would ignore SIGTERM), and with TINI_KILL_PROCESS_GROUP=1
+    # (in build_common_env) `docker stop` delivers SIGTERM to the whole process group.
     docker_cmd = [
-        "docker", "run", "--rm",
+        "docker", "run", "--rm", "--init",
         "--add-host", "host.docker.internal:host-gateway",
         "--label", _BATCH_LABEL,
+        "--label", f"rb_item={html_id}",
         "--user", host_uid_gid,
-        "-e", "http_proxy=", "-e", "https_proxy=",
-        "-e", "HTTP_PROXY=", "-e", "HTTPS_PROXY=",
-        "-e", "all_proxy=", "-e", "ALL_PROXY=",
-        "-e", "HOME=/home/node",
-        "-e", "PLAYWRIGHT_BROWSERS_PATH=/home/node/.cache/ms-playwright",
+        *env_args(build_common_env(model_cfg, claude_debug, enable_tasks)),
     ]
-    # Set context window for auto-compact if specified in model config
-    ctx_window = model_cfg.get("context_window")
-    if ctx_window:
-        docker_cmd += [
-            "-e", f"CLAUDE_CODE_AUTO_COMPACT_WINDOW={ctx_window}",
-            "-e", "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=60",
-        ]
-    # Claude Code verbose debug logging (writes to .claude/debug/)
-    if claude_debug:
-        docker_cmd += [
-            "-e", "CLAUDE_CODE_DEBUG_LOG_LEVEL=verbose",
-            "-e", "CLAUDE_CODE_ENABLE_TASKS=1",
-        ]
-    docker_cmd += [
-        "-v", f"{run_home}:/home/node",
-        "-w", "/home/node",
-        "-v", "eval-interact-review-pw-cache:/home/node/.cache/ms-playwright",
-        "-v", f"{HTMLS_DIR}/{html_id}.html:/data/resources/htmls/{html_id}.html:ro",
-        "-v", f"{CONTEXTS_DIR}/{html_id}.json:/data/resources/contexts/{html_id}.json:ro",
-        "-v", f"{rubric_view}:/data/rubrics:ro",
-        "-v", f"{output_base}:/app/outputs",
-        "-v", f"{prompt_file}:/tmp/prompt.md:ro",
-        "-v", f"{review_mcp_file}:/tmp/review_mcp.json:ro",
-        "-v", f"{score_mcp_file}:/tmp/score_mcp.json:ro",
-        "-v", f"{Path(__file__).resolve().parent / 'api_proxy.py'}:/opt/api_proxy.py:ro",
-        "-v", f"{SCORE_SERVER_SCRIPT}:/opt/review/score_server.py:ro",
-    ]
+    docker_cmd += build_mounts(
+        run_home=run_home, html_id=html_id, rubric_view=rubric_view, item_root=item_root,
+        scaffolding=scaffolding, model=model, prompt_file=prompt_file,
+        review_mcp_file=review_mcp_file, score_mcp_file=score_mcp_file,
+        proxy_script=Path(__file__).resolve().parent / "api_proxy.py",
+        score_server_script=SCORE_SERVER_SCRIPT,
+        htmls_dir=HTMLS_DIR, contexts_dir=CONTEXTS_DIR,
+    )
 
     # Remap localhost URLs to host.docker.internal (containers no longer use --network host)
     _raw_api_base = model_cfg.get("anthropic_base_url") or model_cfg.get("openai_base_url", "http://127.0.0.1:8001")
@@ -404,14 +812,9 @@ def run_single(
         )
         progress_path = f"/app/outputs/{scaffolding}/{model}/results/scores/.progress/{html_id}.json"
         trace_file = f"/app/outputs/{scaffolding}/{model}/traces/{html_id}.jsonl"
-        # In debug mode, start per-container proxy and route through it
-        if debug:
-            proxy_start = (
-                f"mkdir -p /app/outputs/{scaffolding}/{model}/traces/log && "
-                f"UPSTREAM={api_base} TRACE_FILE={trace_file} "
-                f"python3 /opt/api_proxy.py {IN_CONTAINER_PROXY_PORT} > /tmp/proxy.log 2>/app/outputs/{scaffolding}/{model}/traces/log/{html_id}.proxy.log &"
-                f"sleep 1 && "
-            )
+        # With capture on, start per-container proxy and route through it
+        if capture:
+            proxy_start = build_proxy_start(scaffolding, model, html_id, api_base)
             actual_api_base = f"http://127.0.0.1:{IN_CONTAINER_PROXY_PORT}"
         else:
             proxy_start = ""
@@ -443,16 +846,8 @@ def run_single(
             f"fi ; "
             f"done"
         )
-        # Map all Claude Code model aliases to the actual model name
         docker_cmd += [
-            "-e", f"ANTHROPIC_API_KEY={model_cfg['api_key']}",
-            "-e", f"ANTHROPIC_BASE_URL={actual_api_base}",
-            "-e", f"ANTHROPIC_MODEL={model}",
-            "-e", f"ANTHROPIC_SMALL_FAST_MODEL={model}",
-            "-e", f"ANTHROPIC_DEFAULT_SONNET_MODEL={model}",
-            "-e", f"ANTHROPIC_DEFAULT_OPUS_MODEL={model}",
-            "-e", f"ANTHROPIC_DEFAULT_HAIKU_MODEL={model}",
-            "-e", "API_TIMEOUT_MS=600000",
+            *env_args(build_claude_code_env(model, model_cfg["api_key"], actual_api_base, claude_env)),
             base_image,
             "bash", "-c",
             bash_cmd,
@@ -462,16 +857,11 @@ def run_single(
         trace_file = f"/app/outputs/{scaffolding}/{model}/traces/{html_id}.jsonl"
         vllm_url = model_cfg.get("openai_base_url", "http://127.0.0.1:8001/v1")
         vllm_url = vllm_url.replace("127.0.0.1", "host.docker.internal").replace("localhost", "host.docker.internal")
-        # In debug mode, route through per-container proxy
-        if debug:
+        # With capture on, route through per-container proxy
+        if capture:
             proxy_base_url = f"http://127.0.0.1:{IN_CONTAINER_PROXY_PORT}/v1"
             upstream_for_proxy = vllm_url.rsplit("/v1", 1)[0]
-            proxy_start = (
-                f"mkdir -p /app/outputs/{scaffolding}/{model}/traces/log && "
-                f"UPSTREAM={upstream_for_proxy} TRACE_FILE={trace_file} "
-                f"python3 /opt/api_proxy.py {IN_CONTAINER_PROXY_PORT} > /tmp/proxy.log 2>/app/outputs/{scaffolding}/{model}/traces/log/{html_id}.proxy.log &"
-                f"sleep 1 && "
-            )
+            proxy_start = build_proxy_start(scaffolding, model, html_id, upstream_for_proxy)
         else:
             proxy_base_url = vllm_url
             proxy_start = ""
@@ -542,15 +932,10 @@ def run_single(
         score_path = f"/app/outputs/{scaffolding}/{model}/results/scores/{html_id}.json"
         trace_file = f"/app/outputs/{scaffolding}/{model}/traces/{html_id}.jsonl"
 
-        # In debug mode, route through per-container proxy
-        if debug:
+        # With capture on, route through per-container proxy
+        if capture:
             kimi_api_base = f"http://127.0.0.1:{IN_CONTAINER_PROXY_PORT}"
-            proxy_start = (
-                f"mkdir -p /app/outputs/{scaffolding}/{model}/traces/log && "
-                f"UPSTREAM={api_base} TRACE_FILE={trace_file} "
-                f"python3 /opt/api_proxy.py {IN_CONTAINER_PROXY_PORT} > /tmp/proxy.log 2>/app/outputs/{scaffolding}/{model}/traces/log/{html_id}.proxy.log &"
-                f"sleep 1 && "
-            )
+            proxy_start = build_proxy_start(scaffolding, model, html_id, api_base)
         else:
             kimi_api_base = api_base
             proxy_start = ""
@@ -625,15 +1010,10 @@ def run_single(
         score_path = f"/app/outputs/{scaffolding}/{model}/results/scores/{html_id}.json"
         trace_file = f"/app/outputs/{scaffolding}/{model}/traces/{html_id}.jsonl"
 
-        # In debug mode, route through per-container proxy
-        if debug:
+        # With capture on, route through per-container proxy
+        if capture:
             opencode_api_base = f"http://127.0.0.1:{IN_CONTAINER_PROXY_PORT}/v1"
-            proxy_start = (
-                f"mkdir -p /app/outputs/{scaffolding}/{model}/traces/log && "
-                f"UPSTREAM={api_base} TRACE_FILE={trace_file} "
-                f"python3 /opt/api_proxy.py {IN_CONTAINER_PROXY_PORT} > /tmp/proxy.log 2>/app/outputs/{scaffolding}/{model}/traces/log/{html_id}.proxy.log &"
-                f"sleep 1 && "
-            )
+            proxy_start = build_proxy_start(scaffolding, model, html_id, api_base)
         else:
             opencode_api_base = model_cfg.get("openai_base_url", "http://127.0.0.1:8001/v1")
             opencode_api_base = opencode_api_base.replace("127.0.0.1", "host.docker.internal").replace("localhost", "host.docker.internal")
@@ -706,13 +1086,8 @@ def run_single(
         score_path = f"/app/outputs/{scaffolding}/{model}/results/scores/{html_id}.json"
         progress_path = f"/app/outputs/{scaffolding}/{model}/results/scores/.progress/{html_id}.json"
         trace_file = f"/app/outputs/{scaffolding}/{model}/traces/{html_id}.jsonl"
-        if debug:
-            proxy_start = (
-                f"mkdir -p /app/outputs/{scaffolding}/{model}/traces/log && "
-                f"UPSTREAM={api_base} TRACE_FILE={trace_file} "
-                f"python3 /opt/api_proxy.py {IN_CONTAINER_PROXY_PORT} > /tmp/proxy.log 2>/app/outputs/{scaffolding}/{model}/traces/log/{html_id}.proxy.log &"
-                f"sleep 1 && "
-            )
+        if capture:
+            proxy_start = build_proxy_start(scaffolding, model, html_id, api_base)
             actual_api_base = f"http://127.0.0.1:{IN_CONTAINER_PROXY_PORT}"
         else:
             proxy_start = ""
@@ -767,13 +1142,8 @@ def run_single(
         score_path = f"/app/outputs/{scaffolding}/{model}/results/scores/{html_id}.json"
         progress_path = f"/app/outputs/{scaffolding}/{model}/results/scores/.progress/{html_id}.json"
         trace_file = f"/app/outputs/{scaffolding}/{model}/traces/{html_id}.jsonl"
-        if debug:
-            proxy_start = (
-                f"mkdir -p /app/outputs/{scaffolding}/{model}/traces/log && "
-                f"UPSTREAM={api_base} TRACE_FILE={trace_file} "
-                f"python3 /opt/api_proxy.py {IN_CONTAINER_PROXY_PORT} > /tmp/proxy.log 2>/app/outputs/{scaffolding}/{model}/traces/log/{html_id}.proxy.log &"
-                f"sleep 1 && "
-            )
+        if capture:
+            proxy_start = build_proxy_start(scaffolding, model, html_id, api_base)
             actual_api_base = f"http://127.0.0.1:{IN_CONTAINER_PROXY_PORT}"
         else:
             proxy_start = ""
@@ -835,27 +1205,37 @@ def run_single(
     else:
         return {"html_id": html_id, "status": "error", "error": f"Unknown scaffolding: {scaffolding}"}
 
+    finish_ctx = {"html_id": html_id, "run_home": run_home, "item_root": item_root,
+                  "image": base_image, "scores_dir": scores_dir, "out_dir": out_dir,
+                  "archive_attempts": archive_attempts}
+    exit_code = None
+    stopped_by = "error"
     try:
         proc = subprocess.Popen(docker_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
             stdout, stderr = proc.communicate(timeout=container_timeout)
         except subprocess.TimeoutExpired:
-            # Don't kill the container — leave it running, let end-of-batch handle it
+            # Don't stop the container — leave it running, let end-of-batch handle it
+            # (finalize_timed_out stops it, reaps it and post-processes the item)
             elapsed = time.time() - start
+            stopped_by = classify_end(True, _stop_event.is_set())
             log.warning(f"[{html_id}] TIMEOUT after {elapsed:.0f}s (limit={container_timeout}s), container left running")
+            with _timed_out_lock:
+                _timed_out[html_id] = {**finish_ctx, "proc": proc}
             # Check if score was written despite timeout (container may have finished scoring)
-            fix_permissions(run_home, base_image)
-            if score_file.exists():
+            fix_permissions([run_home, item_root], base_image)
+            if sync_score_to_central(item_root, scores_dir, html_id):
                 log.info(f"[{html_id}] TIMEOUT but score file exists — counting as success")
                 status = "success"
             else:
                 status = "timeout"
         else:
             elapsed = time.time() - start
+            exit_code = proc.returncode
+            stopped_by = classify_end(False, _stop_event.is_set())
             if proc.returncode != 0 and stderr:
                 log.warning(f"[{html_id}] docker exit={proc.returncode}: {stderr.decode(errors='replace')[:300]}")
-            fix_permissions(run_home, base_image)
-            if score_file.exists():
+            if _finish_item(finish_ctx):
                 log.info(f"[{html_id}] DONE in {elapsed:.0f}s")
                 status = "success"
             else:
@@ -881,13 +1261,21 @@ def run_single(
         elif scaffolding == "qwen_code":
             passwd_file.unlink(missing_ok=True)
 
-    return {
+    result = {
         "html_id": html_id,
         "status": status,
         "elapsed": round(elapsed, 1),
         "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(start)),
         "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(start + elapsed)),
+        "exit_code": exit_code,
+        "stopped_by": stopped_by,
+        "capture": capture,
+        "item_root": str(item_root),
     }
+    if capture and exit_code == PROXY_NOT_READY_EXIT and proxy_not_ready(item_root, html_id):
+        log.error(f"[{html_id}] capture proxy never became ready; agent was not run")
+        result["capture_failed"] = True
+    return result
 
 
 def load_model_config(config_path: str) -> dict:
@@ -913,9 +1301,11 @@ def main():
     parser.add_argument("--retry-failed", action="store_true")
     parser.add_argument("--output-base", default=None, help="Override OUTPUT_BASE")
     parser.add_argument("--container-timeout", type=int, default=None)
-    parser.add_argument("--debug", action="store_true", help="Record raw API traces")
+    parser.add_argument("--debug", action="store_true",
+                        help="Legacy flag; trace capture is now controlled by run config 'capture' (default true)")
     parser.add_argument("--claude-debug", action="store_true", help="Enable claude --debug verbose logging")
     args = parser.parse_args()
+    _install_signal_handlers()
 
     # Load run config JSON if provided, then overlay CLI args
     run_cfg = {}
@@ -938,6 +1328,12 @@ def main():
         args.debug = run_cfg.get("debug", False)
     if not args.claude_debug:
         args.claude_debug = run_cfg.get("claude_debug", False)
+    capture = bool(run_cfg.get("capture", True))
+    enable_tasks = bool(run_cfg.get("enable_tasks", False))
+    claude_env = run_cfg.get("claude_env") or None
+    if claude_env is not None and not isinstance(claude_env, dict):
+        parser.error("run config 'claude_env' must be an object")
+    archive_attempts = bool(run_cfg.get("archive_attempts", False))
 
     if not args.model_config or not args.scaffolding:
         parser.error("--model-config and --scaffolding are required (via CLI or --config)")
@@ -972,9 +1368,12 @@ def main():
 
     ensure_playwright_volume()
 
-    if args.debug:
-        (out_dir / "traces").mkdir(parents=True, exist_ok=True)
-        log.info("Debug mode: per-container API proxy will log traces")
+    if capture:
+        log.info("Capture on: per-container API proxy logs traces to items/<id>/traces/")
+    else:
+        log.warning("Capture OFF (run config capture=false): agents talk to the API directly")
+    if archive_attempts and not shutil.which("zstd"):
+        log.warning("archive_attempts=true but zstd is not on PATH; archives will be skipped")
 
     # Resolve html_ids from raw_ids
     # Supports: None/"all", list of IDs, Python slice "[:40]" "[10:20]" "[::2]",
@@ -1006,9 +1405,12 @@ def main():
     html_ids = _resolve_ids(raw_ids)
     log.info(f"Resolved {len(html_ids)} HTML IDs")
 
-    # Resume: skip already scored
+    # Resume: skip already scored (central scores dir, plus per-item roots not yet synced)
     if not args.retry_failed:
         existing = {f.stem for f in scores_dir.glob("*.json")}
+        existing |= {p.parent.parent.parent.name
+                     for p in (out_dir / "items").glob("*/results/scores/*.json")
+                     if p.stem == p.parent.parent.parent.name}
         if existing:
             log.info(f"Resuming: {len(existing)} already scored, skipping")
             html_ids = [h for h in html_ids if h not in existing]
@@ -1029,6 +1431,28 @@ def main():
                  f"generation={vllm_tokens_start['generation_tokens']:.0f}, "
                  f"cached={vllm_tokens_start['cached_tokens']:.0f}")
 
+    # Run manifest: exactly what this batch runs (code, image, configs, env, prompt)
+    effective_cfg = {
+        "model_config": str(model_config_path), "scaffolding": args.scaffolding,
+        "html_ids": html_ids, "concurrent": args.concurrent,
+        "container_timeout": args.container_timeout, "output_base": str(output_base),
+        "retry_failed": args.retry_failed, "debug": args.debug, "claude_debug": args.claude_debug,
+        "capture": capture, "enable_tasks": enable_tasks, "claude_env": claude_env,
+        "archive_attempts": archive_attempts,
+        "max_retry_rounds": int(run_cfg.get("max_retry_rounds", 3)),
+        "track_tokens": track_tokens, "config_path": args.config,
+    }
+    manifest_path = None
+    try:
+        manifest_path = write_run_manifest(
+            out_dir, scaffolding=args.scaffolding, model_cfg=model_cfg,
+            model_config_path=model_config_path, run_cfg=run_cfg, effective_cfg=effective_cfg,
+            claude_env=claude_env, capture=capture, claude_debug=args.claude_debug,
+            enable_tasks=enable_tasks)
+        log.info(f"Run manifest: {manifest_path}")
+    except Exception as e:
+        log.warning(f"Could not write run manifest: {e}")
+
     # batch_log.jsonl: append each result as it completes
     batch_log_file = out_dir / "batch_log.jsonl"
     batch_log_lock = threading.Lock()
@@ -1036,13 +1460,24 @@ def main():
     with open(batch_log_file, "a") as bf:
         bf.write(json.dumps({"event": "batch_start", "model": model_name, "scaffolding": args.scaffolding,
                              "concurrent": args.concurrent, "total_htmls": len(html_ids),
+                             "manifest": str(manifest_path) if manifest_path else None,
                              "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}) + "\n")
 
     def _record_result(r):
         results.append(r)
+        _log_event(r)
+
+    def _log_event(r):
         with batch_log_lock:
             with open(batch_log_file, "a") as bf:
                 bf.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+    def _finalize_timed_out(stop: bool):
+        for ev in finalize_timed_out(stop=stop):
+            _log_event(ev)
+
+    run_kwargs = dict(capture=capture, enable_tasks=enable_tasks, claude_env=claude_env,
+                      archive_attempts=archive_attempts)
 
     results = []
     if args.concurrent <= 1:
@@ -1050,7 +1485,7 @@ def main():
             if _stop_event.is_set():
                 log.info("Stop requested, no more tasks will be dispatched")
                 break
-            r = run_single(html_id, args.scaffolding, model_cfg, scores_dir, workspace_dir, output_base, args.container_timeout, args.debug, args.claude_debug)
+            r = run_single(html_id, args.scaffolding, model_cfg, scores_dir, workspace_dir, output_base, args.container_timeout, args.debug, args.claude_debug, **run_kwargs)
             _record_result(r)
     else:
         # Warmup: stagger launches 5s apart until reaching target concurrency,
@@ -1063,7 +1498,7 @@ def main():
             for html_id in itertools.islice(it, args.concurrent):
                 if _stop_event.is_set():
                     break
-                f = executor.submit(run_single, html_id, args.scaffolding, model_cfg, scores_dir, workspace_dir, output_base, args.container_timeout, args.debug, args.claude_debug)
+                f = executor.submit(run_single, html_id, args.scaffolding, model_cfg, scores_dir, workspace_dir, output_base, args.container_timeout, args.debug, args.claude_debug, **run_kwargs)
                 pending[f] = html_id
                 time.sleep(5)
                 if _stop_event.is_set():
@@ -1083,7 +1518,7 @@ def main():
 
                     html_id = next(it, None)
                     if html_id:
-                        nf = executor.submit(run_single, html_id, args.scaffolding, model_cfg, scores_dir, workspace_dir, output_base, args.container_timeout, args.debug, args.claude_debug)
+                        nf = executor.submit(run_single, html_id, args.scaffolding, model_cfg, scores_dir, workspace_dir, output_base, args.container_timeout, args.debug, args.claude_debug, **run_kwargs)
                         pending[nf] = html_id
 
                 if _stop_event.is_set() and not pending:
@@ -1100,8 +1535,7 @@ def main():
             # Check which ones now have scores
             still_waiting = []
             for html_id in timeout_ids:
-                sf = scores_dir / f"{html_id}.json"
-                if sf.exists():
+                if sync_score_to_central(item_root_dir(out_dir, html_id), scores_dir, html_id):
                     log.info(f"[{html_id}] Container finished scoring → success")
                 else:
                     still_waiting.append(html_id)
@@ -1125,8 +1559,7 @@ def main():
     # Reclassify based on final state
     for r in results:
         if r["status"] == "timeout":
-            score_file = scores_dir / f"{r['html_id']}.json"
-            if score_file.exists():
+            if sync_score_to_central(item_root_dir(out_dir, r["html_id"]), scores_dir, r["html_id"]):
                 r["status"] = "success"
 
     # Summary
@@ -1139,11 +1572,13 @@ def main():
         log.info(f"  {status}: {len(ids)}")
     log.info(f"  Total scored: {len(list(scores_dir.glob('*.json')))}")
 
-    # Kill any remaining timed-out containers
+    # Stop any remaining timed-out containers (docker stop: SIGTERM, SIGKILL after grace)
     timed_out = by_status.get("timeout", [])
     if timed_out:
-        log.info(f"Killing {len(timed_out)} remaining timed-out containers (label={_BATCH_LABEL})...")
+        log.info(f"Stopping {len(timed_out)} remaining timed-out containers (label={_BATCH_LABEL})...")
         _kill_own_containers()
+    # Reap timed-out containers, record exit code / how they ended, sync scores, archive
+    _finalize_timed_out(stop=True)
 
     # --- Retry queue: re-run no_score and timeout items (max 3 rounds) ---
     MAX_RETRY_ROUNDS = int(run_cfg.get("max_retry_rounds", 3))
@@ -1156,6 +1591,7 @@ def main():
             break
         log.info(f"=== Retry round {retry_round}/{MAX_RETRY_ROUNDS}: "
                  f"{len(failed_ids)} failed items ===")
+        _finalize_timed_out(stop=True)  # previous round's timeouts must be stopped before moving
         for html_id in failed_ids:
             _archive_failed(html_id, retry_round, workspace_dir, scores_dir, out_dir)
         for html_id in failed_ids:
@@ -1163,7 +1599,7 @@ def main():
                 break
             r = run_single(html_id, args.scaffolding, model_cfg, scores_dir,
                            workspace_dir, output_base, args.container_timeout,
-                           args.debug, args.claude_debug)
+                           args.debug, args.claude_debug, **run_kwargs)
             _record_result(r)
             for old_r in results:
                 if old_r["html_id"] == html_id and old_r["status"] in ("no_score", "timeout"):
@@ -1175,6 +1611,8 @@ def main():
         log.info(f"After retry {retry_round}:")
         for status, ids in sorted(by_status.items()):
             log.info(f"  {status}: {len(ids)}")
+
+    _finalize_timed_out(stop=True)
 
     # Final summary
     log.info("=== Final Summary ===")
