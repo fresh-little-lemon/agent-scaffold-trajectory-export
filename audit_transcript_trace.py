@@ -17,6 +17,8 @@ from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import urlsplit
 
+from rebuild_wire_jsonl import resolve_sidecar
+
 
 def digest(value: Any) -> str:
     return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True,
@@ -231,6 +233,7 @@ def wire_trace_summary(path: Path) -> dict[str, Any]:
         response_bytes += int(record.get("response_body_bytes", 0) or 0)
         for field in ("request_body_file", "request_transfer_body_file", "response_body_file"):
             value = record.get(field)
+            value = str(resolve_sidecar(value, None, path)) if value else value
             if not value or not Path(value).is_file():
                 missing_files.append({"line": line_number, "field": field, "path": value})
                 continue
@@ -256,6 +259,7 @@ def wire_trace_summary(path: Path) -> dict[str, Any]:
             # count them; the raw sidecar and its digest are audited above.
             model_requests += 1
             response_file = record.get("response_body_file")
+            response_file = str(resolve_sidecar(response_file, None, path)) if response_file else response_file
             if not response_file or not Path(response_file).is_file():
                 continue
             try:

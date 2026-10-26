@@ -32,12 +32,25 @@ def iter_jsonl(path: Path) -> Iterable[dict[str, Any]]:
                 yield record
 
 
-def resolve_sidecar(value: str | None, output_mount: Path | None) -> Path | None:
+def resolve_sidecar(value: str | None, output_mount: Path | None,
+                    trace_path: Path | None = None) -> Path | None:
+    """Find a sidecar recorded under a container path.
+
+    Sidecars always live in ``<trace>.wire/``, so the part from ``<trace name>.wire/`` on is joined to
+    the host trace's directory; this needs no knowledge of how the container mounted its outputs.
+    ``output_mount`` (host dir mounted as /app/outputs) remains as a fallback for old layouts.
+    """
     if not value:
         return None
     path = Path(value)
     if path.is_file():
         return path
+    if trace_path is not None:
+        marker = trace_path.name + ".wire/"
+        if marker in value:
+            mapped = trace_path.parent / value[value.index(marker):]
+            if mapped.is_file():
+                return mapped
     prefix = "/app/outputs/"
     if output_mount and value.startswith(prefix):
         mapped = output_mount / value[len(prefix):]
@@ -462,12 +475,12 @@ def capture_status(record: dict[str, Any], response_bytes: int | None) -> str:
 
 
 def write_exchange(stream: TextIO, record: dict[str, Any], output_mount: Path | None,
-                   max_json_bytes: int) -> None:
+                   max_json_bytes: int, trace_path: Path | None = None) -> None:
     request_headers = record.get("request_headers") or []
     response_headers = record.get("response_headers") or []
-    request_path = resolve_sidecar(record.get("request_body_file"), output_mount)
-    transfer_path = resolve_sidecar(record.get("request_transfer_body_file"), output_mount)
-    response_path = resolve_sidecar(record.get("response_body_file"), output_mount)
+    request_path = resolve_sidecar(record.get("request_body_file"), output_mount, trace_path)
+    transfer_path = resolve_sidecar(record.get("request_transfer_body_file"), output_mount, trace_path)
+    response_path = resolve_sidecar(record.get("response_body_file"), output_mount, trace_path)
 
     request_body, request_error = body_json(request_path, request_headers, max_json_bytes)
     protocol = detect_protocol(str(record.get("request_target", "")))
@@ -615,7 +628,7 @@ def rebuild(trace_path: Path, output_path: Path, output_mount: Path | None,
                 "(SELECT MIN(started) FROM records AS r WHERE r.run_id = records.run_id), "
                 "run_id, sequence, ordinal")
             for (value,) in cursor:
-                write_exchange(output, json.loads(value), output_mount, max_json_bytes)
+                write_exchange(output, json.loads(value), output_mount, max_json_bytes, trace_path)
                 output.flush()
         database.close()
     return count
