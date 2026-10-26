@@ -15,5 +15,8 @@
   "stop_hook": "e2e/tasks/hooks/require_deliverables.py",
   "auto_compact_window": 200000,
   "autocompact_pct": 80,
-  "effort": "high"
+  "effort": "high",
+  "claude_env": {
+    "ENABLE_TOOL_SEARCH": "false"
+  }
 }

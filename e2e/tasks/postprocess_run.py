@@ -175,7 +175,7 @@ def main() -> int:
             if " ERROR " not in line and "Traceback" not in line:
                 current = None
                 continue
-            stamp = line.split(" ERROR ")[0][-24:]
+            stamp = line.split(" ERROR ", 1)[1][:14] if " ERROR " in line else ""
             if current is None or current["stamp"] != stamp:
                 current = {"stamp": stamp, "first": line[:300], "message": ""}
             text = line.split("] ", 1)[-1].strip()
