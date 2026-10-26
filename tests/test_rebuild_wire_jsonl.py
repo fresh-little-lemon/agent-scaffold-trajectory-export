@@ -189,3 +189,81 @@ def test_rebuild_orders_concurrent_proxy_records_by_request_sequence(tmp_path):
 
     assert [json.loads(line)["sequence"]
             for line in output.read_text(encoding="utf-8").splitlines()] == [1, 2]
+
+
+def _sse(*events):
+    lines = []
+    for event in events:
+        lines.append(f"event: {event['type']}\n".encode())
+        lines.append(f"data: {json.dumps(event)}\n\n".encode())
+    return b"".join(lines)
+
+
+def _sse_lines(payload):
+    return payload.splitlines(keepends=True)
+
+
+START = {"type": "message_start", "message": {"id": "m1", "role": "assistant", "content": []}}
+BLOCK = {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}
+DELTA = {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Hel"}}
+
+
+def test_messages_stream_termination_is_reported():
+    complete = accumulate_messages(iter_sse_events(_sse_lines(_sse(
+        START, BLOCK, DELTA, {"type": "content_block_stop", "index": 0},
+        {"type": "message_delta", "delta": {"stop_reason": "end_turn"}}, {"type": "message_stop"}))))
+    assert complete["_stream"]["termination"] == "message_stop"
+    errored = accumulate_messages(iter_sse_events(_sse_lines(_sse(
+        START, BLOCK, DELTA,
+        {"type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}}))))
+    assert errored["_stream"]["termination"] == "error_event"
+    assert errored["_stream"]["errors"] == [{"type": "overloaded_error", "message": "Overloaded"}]
+    assert errored["_stream"]["unclosed_blocks"] == [0]
+    assert errored["content"][0]["text"] == "Hel"
+    cut = accumulate_messages(iter_sse_events(_sse_lines(_sse(START, BLOCK, DELTA)[:-5])))
+    assert cut["_stream"]["termination"] == "eof_without_message_stop"
+
+
+def test_rebuild_recovers_interrupted_exchange_from_journal(tmp_path):
+    request = b'{"model":"x","stream":true,"messages":[]}'
+    partial = _sse(START, BLOCK, DELTA)
+    (tmp_path / "req.bin").write_bytes(request)
+    (tmp_path / "resp.bin").write_bytes(partial)
+    trace = tmp_path / "trace.jsonl"
+    trace.write_text("", encoding="utf-8")
+    journal = tmp_path / "trace.jsonl.journal.jsonl"
+    journal.write_text("\n".join(json.dumps(e) for e in [
+        {"event": "proxy_start", "proxy_run_id": "r1"},
+        {"event": "exchange_start", "proxy_run_id": "r1", "n": 1, "id": "x1", "started_at": 1.0,
+         "method": "POST", "request_target": "/v1/messages",
+         "request_headers": [["Content-Type", "application/json"]],
+         "request_body_file": str(tmp_path / "req.bin"),
+         "request_transfer_body_file": str(tmp_path / "req.bin"),
+         "response_body_file": str(tmp_path / "resp.bin")},
+        {"event": "response_head", "proxy_run_id": "r1", "n": 1, "status": 200, "reason": "OK",
+         "response_headers": [["content-type", "text/event-stream"]]},
+    ]) + "\n", encoding="utf-8")
+    output = tmp_path / "out.jsonl"
+
+    assert rebuild(trace, output, None, 1 << 20) == 1
+
+    record = json.loads(output.read_text(encoding="utf-8"))
+    assert record["capture"]["capture_status"] == "interrupted"
+    assert "SIGKILL" in record["capture"]["interrupted"]["by"]
+    assert record["request"]["body"]["model"] == "x"
+    assert record["response"]["body_format"] == "sse_partial"
+    assert record["response"]["body"]["content"][0]["text"] == "Hel"
+    assert record["response"]["stream"]["termination"] == "eof_without_message_stop"
+
+
+def test_rebuild_orders_restarted_proxy_runs_before_sequence(tmp_path):
+    trace = tmp_path / "trace.jsonl"
+    rows = [{"schema_version": 3, "proxy_run_id": "late", "n": 1, "started_at": 20.0},
+            {"schema_version": 3, "proxy_run_id": "early", "n": 2, "started_at": 11.0},
+            {"schema_version": 3, "proxy_run_id": "early", "n": 1, "started_at": 10.0}]
+    trace.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    output = tmp_path / "out.jsonl"
+    rebuild(trace, output, None, 1024)
+    got = [(r["proxy_run_id"], r["sequence"])
+           for r in map(json.loads, output.read_text(encoding="utf-8").splitlines())]
+    assert got == [("early", 1), ("early", 2), ("late", 1)]

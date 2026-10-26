@@ -185,14 +185,30 @@ def _finish_json(value: str) -> Any:
 
 
 def accumulate_messages(events: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    """Fold Messages SSE into the non-streaming shape.
+
+    How the stream ended goes to ``response["_stream"]`` (popped by
+    ``parse_response``): a non-streaming call either returns the whole message
+    or an HTTP error, while a stream can commit HTTP 200 and then end in an
+    ``error`` event or a bare EOF. Such a partial message has no non-streaming
+    equivalent, so it must be flagged rather than look like a short answer.
+    """
     response: dict[str, Any] = {"type": "message", "role": "assistant", "content": []}
     blocks: dict[int, dict[str, Any]] = {}
+    stopped_blocks: set[int] = set()
+    stream: dict[str, Any] = {"message_stop": False, "errors": [], "unknown_events": [],
+                              "unparsed_events": 0}
     for event in events:
         obj = _json_data(event)
         if obj is None:
+            # A trailing half-written event at EOF lands here too.
+            if event.get("data") not in (None, "[DONE]"):
+                stream["unparsed_events"] += 1
             continue
         typ = obj.get("type") or event.get("event")
-        if typ == "message_start":
+        if typ == "error":
+            stream["errors"].append(obj.get("error", obj))
+        elif typ == "message_start":
             response.update(obj.get("message") or {})
         elif typ == "content_block_start":
             index = int(obj.get("index", 0))
@@ -217,10 +233,13 @@ def accumulate_messages(events: Iterable[dict[str, Any]]) -> dict[str, Any]:
             elif delta_type == "input_json_delta":
                 block["_partial_json"] = block.get("_partial_json", "") + delta.get("partial_json", "")
             elif delta_type == "citations_delta":
-                block.setdefault("citations", []).append(delta)
+                block.setdefault("citations", []).append(delta.get("citation", delta))
+            else:
+                stream["unknown_events"].append(obj)
             response["content"] = [blocks[key] for key in sorted(blocks)]
         elif typ == "content_block_stop":
             index = int(obj.get("index", 0))
+            stopped_blocks.add(index)
             block = blocks.get(index)
             if block and "_partial_json" in block:
                 block["input"] = _finish_json(block.pop("_partial_json"))
@@ -229,15 +248,33 @@ def accumulate_messages(events: Iterable[dict[str, Any]]) -> dict[str, Any]:
             for key in ("stop_reason", "stop_sequence"):
                 if key in delta:
                     response[key] = delta[key]
+            for key, value in delta.items():
+                if key not in ("stop_reason", "stop_sequence"):
+                    stream.setdefault("message_delta_extra", {})[key] = value
             if isinstance(obj.get("usage"), dict):
                 response.setdefault("usage", {}).update(obj["usage"])
         elif typ == "message_stop":
-            response["_stream_complete"] = True
-    for block in blocks.values():
+            stream["message_stop"] = True
+        elif typ != "ping":
+            stream["unknown_events"].append(obj)
+    unfinished_tool_json = []
+    for index, block in blocks.items():
         if "_partial_json" in block:
-            block["input"] = _finish_json(block.pop("_partial_json"))
+            raw = block.pop("_partial_json")
+            block["input"] = _finish_json(raw)
+            if not isinstance(block["input"], dict):
+                unfinished_tool_json.append(index)
     response["content"] = [blocks[key] for key in sorted(blocks)]
-    response.pop("_stream_complete", None)
+    if stream["errors"]:
+        termination = "error_event"
+    elif stream["message_stop"]:
+        termination = "message_stop"
+    else:
+        termination = "eof_without_message_stop"
+    stream.update(termination=termination,
+                  unclosed_blocks=sorted(set(blocks) - stopped_blocks),
+                  unfinished_tool_json=unfinished_tool_json)
+    response["_stream"] = stream
     return response
 
 
@@ -378,7 +415,11 @@ def parse_response(path: Path | None, headers: list, protocol: str | None,
     try:
         with decoded_reader(path, headers) as source:
             value = accumulator(iter_sse_events(source))
-        return value, None, "sse_accumulated"
+        if not (isinstance(value, dict) and isinstance(value.get("_stream"), dict)):
+            return value, None, "sse_accumulated"
+        termination = value["_stream"]["termination"]
+        return value, None, ("sse_accumulated" if termination == "message_stop"
+                             else "sse_partial")
     except (OSError, EOFError, gzip.BadGzipFile, ValueError) as exc:
         return None, f"{type(exc).__name__}: {exc}", "sse"
 
@@ -400,6 +441,26 @@ def integrity(path: Path | None, expected_bytes: int | None,
     }
 
 
+def capture_status(record: dict[str, Any], response_bytes: int | None) -> str:
+    """One word for what happened on the wire, independent of the HTTP status."""
+    if record.get("record_type") == "interrupted":
+        return "interrupted"
+    if record.get("proxy_synthesized_response"):
+        return "no_upstream_response"
+    if record.get("client_disconnected"):
+        return "client_disconnected"
+    if record.get("response_complete") is False:
+        return "upstream_body_truncated"
+    lengths = header_values(record.get("response_headers") or [], "content-length")
+    if lengths and response_bytes is not None and record.get("method") != "HEAD":
+        try:
+            if int(lengths[-1]) != response_bytes:
+                return "upstream_body_truncated"
+        except ValueError:
+            pass
+    return "complete"
+
+
 def write_exchange(stream: TextIO, record: dict[str, Any], output_mount: Path | None,
                    max_json_bytes: int) -> None:
     request_headers = record.get("request_headers") or []
@@ -412,11 +473,17 @@ def write_exchange(stream: TextIO, record: dict[str, Any], output_mount: Path | 
     protocol = detect_protocol(str(record.get("request_target", "")))
     response_body, response_error, response_format = parse_response(
         response_path, response_headers, protocol, max_json_bytes)
+    stream_summary = None
+    if isinstance(response_body, dict) and isinstance(response_body.get("_stream"), dict):
+        stream_summary = response_body.pop("_stream")
     if request_body is not None and not isinstance(request_body, (dict, list)):
         request_error = "request JSON root is not an object or array"
+    response_integrity = integrity(response_path, record.get("response_body_bytes"),
+                                   record.get("response_body_sha256"))
 
     rebuilt = {
-        "schema": "api-exchange-json-v2",
+        "schema": "api-exchange-json-v3",
+        "proxy_run_id": record.get("proxy_run_id"),
         "sequence": record.get("n"),
         "exchange_id": record.get("id"),
         "request": {
@@ -435,15 +502,22 @@ def write_exchange(stream: TextIO, record: dict[str, Any], output_mount: Path | 
             "headers": response_headers,
             "body": response_body,
             "body_format": response_format,
-            "body_integrity": integrity(response_path, record.get("response_body_bytes"),
-                                         record.get("response_body_sha256")),
+            "stream": stream_summary,
+            "body_integrity": response_integrity,
         },
         "capture": {
+            "capture_status": capture_status(record, response_integrity.get("byte_length")),
+            "started_at": record.get("started_at"),
+            "response_head_at": record.get("response_head_at"),
             "timestamp": record.get("timestamp"),
             "duration_s": record.get("duration_s"),
             "response_complete": record.get("response_complete"),
             "client_disconnected": record.get("client_disconnected"),
+            "upstream_status": record.get("upstream_status", record.get("response_status")),
+            "proxy_synthesized_response": record.get("proxy_synthesized_response", False),
+            "failure_phase": record.get("failure_phase"),
             "proxy_error": record.get("error"),
+            "interrupted": record.get("interrupted"),
             "request_transfer_body_integrity": integrity(
                 transfer_path, record.get("request_transfer_body_bytes"),
                 record.get("request_transfer_body_sha256")),
@@ -455,27 +529,91 @@ def write_exchange(stream: TextIO, record: dict[str, Any], output_mount: Path | 
     stream.write("\n")
 
 
+def interrupted_records(journal_path: Path, finished: set[tuple[str, int]]) -> list[dict[str, Any]]:
+    """Exchanges the journal saw start but the trace never saw finish.
+
+    Their sidecars hold every byte received before the proxy died; byte counts
+    and hashes are unknown to the trace, so integrity is taken from the files.
+    """
+    starts: dict[tuple[str, int], dict[str, Any]] = {}
+    heads: dict[tuple[str, int], dict[str, Any]] = {}
+    stops: dict[str, dict[str, Any]] = {}
+    for event in iter_jsonl(journal_path):
+        key = (str(event.get("proxy_run_id") or ""), int(event.get("n", 0) or 0))
+        kind = event.get("event")
+        if kind == "exchange_start":
+            starts[key] = event
+        elif kind == "response_head":
+            heads[key] = event
+        elif kind == "proxy_stop":
+            stops[key[0]] = event
+    records = []
+    for key, start in starts.items():
+        if key in finished:
+            continue
+        head = heads.get(key, {})
+        stop = stops.get(key[0])
+        records.append({
+            "record_type": "interrupted",
+            "proxy_run_id": key[0],
+            "n": key[1],
+            **{name: start.get(name) for name in (
+                "id", "started_at", "method", "request_line", "request_target",
+                "upstream_origin", "http_version", "request_headers", "request_body_file",
+                "request_transfer_body_file", "response_body_file")},
+            "response_status": head.get("status"),
+            "response_reason": head.get("reason"),
+            "response_headers": head.get("response_headers") or [],
+            "response_head_at": head.get("at"),
+            "response_complete": False,
+            "interrupted": {
+                "by": f"signal {stop.get('signal')}" if stop else "proxy died without a stop event (SIGKILL)",
+                "last_journal_phase": "response_head" if head else "exchange_start",
+            },
+        })
+    return records
+
+
 def rebuild(trace_path: Path, output_path: Path, output_mount: Path | None,
-            max_json_bytes: int) -> int:
+            max_json_bytes: int, journal_path: Path | None = None) -> int:
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    if journal_path is None:
+        journal_path = trace_path.with_name(trace_path.name + ".journal.jsonl")
     # Proxy records are appended after responses complete, so concurrent calls
-    # may appear out of order. SQLite sorts only the small metadata records;
+    # may appear out of order. Order is by proxy process (its first exchange),
+    # then by arrival number n. SQLite sorts only the small metadata records;
     # large request/response payloads remain streamed from sidecars.
     with tempfile.TemporaryDirectory(prefix="wire-jsonl-sort-") as temporary:
         database = sqlite3.connect(Path(temporary) / "records.sqlite3")
-        database.execute("CREATE TABLE records (sequence INTEGER, ordinal INTEGER, value TEXT)")
+        database.execute("CREATE TABLE records (run_id TEXT, started REAL, sequence INTEGER, "
+                         "ordinal INTEGER, value TEXT)")
+        finished: set[tuple[str, int]] = set()
+
+        def insert(ordinal: int, record: dict[str, Any]) -> None:
+            run_id = str(record.get("proxy_run_id") or "")
+            started = record.get("started_at")
+            if started is None and record.get("timestamp") is not None:
+                started = float(record["timestamp"]) - float(record.get("duration_s") or 0)
+            database.execute("INSERT INTO records VALUES (?, ?, ?, ?, ?)", (
+                run_id, started, int(record.get("n", 0) or 0), ordinal,
+                json.dumps(record, ensure_ascii=False, separators=(",", ":"))))
+
         count = 0
         for count, record in enumerate(iter_jsonl(trace_path), 1):
-            database.execute(
-                "INSERT INTO records VALUES (?, ?, ?)",
-                (int(record.get("n", 0) or 0), count,
-                 json.dumps(record, ensure_ascii=False, separators=(",", ":"))),
-            )
+            finished.add((str(record.get("proxy_run_id") or ""), int(record.get("n", 0) or 0)))
+            insert(count, record)
             if count % 1000 == 0:
                 database.commit()
+        if journal_path.is_file():
+            for record in interrupted_records(journal_path, finished):
+                count += 1
+                insert(count, record)
         database.commit()
         with output_path.open("w", encoding="utf-8", newline="\n") as output:
-            cursor = database.execute("SELECT value FROM records ORDER BY sequence, ordinal")
+            cursor = database.execute(
+                "SELECT value FROM records ORDER BY "
+                "(SELECT MIN(started) FROM records AS r WHERE r.run_id = records.run_id), "
+                "run_id, sequence, ordinal")
             for (value,) in cursor:
                 write_exchange(output, json.loads(value), output_mount, max_json_bytes)
                 output.flush()
@@ -491,11 +629,13 @@ def main() -> int:
                         help="reconstructed JSONL destination")
     parser.add_argument("--output-mount", type=Path,
                         help="host directory mounted as /app/outputs in capture records")
+    parser.add_argument("--journal", type=Path,
+                        help="proxy write-ahead journal (default: <trace>.journal.jsonl)")
     parser.add_argument("--max-json-mib", type=int, default=256,
                         help="maximum decoded body size parsed into a JSON object (default: 256 MiB)")
     args = parser.parse_args()
     count = rebuild(args.trace, args.output, args.output_mount,
-                    max_json_bytes=args.max_json_mib * 1024 * 1024)
+                    max_json_bytes=args.max_json_mib * 1024 * 1024, journal_path=args.journal)
     print(json.dumps({"records": count, "output": str(args.output)}, ensure_ascii=False))
     return 0
 

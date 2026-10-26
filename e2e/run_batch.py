@@ -1063,7 +1063,7 @@ def main():
             for html_id in itertools.islice(it, args.concurrent):
                 if _stop_event.is_set():
                     break
-                f = executor.submit(run_single, html_id, args.scaffolding, model_cfg, scores_dir, workspace_dir, output_base, args.container_timeout, args.debug)
+                f = executor.submit(run_single, html_id, args.scaffolding, model_cfg, scores_dir, workspace_dir, output_base, args.container_timeout, args.debug, args.claude_debug)
                 pending[f] = html_id
                 time.sleep(5)
                 if _stop_event.is_set():
@@ -1083,7 +1083,7 @@ def main():
 
                     html_id = next(it, None)
                     if html_id:
-                        nf = executor.submit(run_single, html_id, args.scaffolding, model_cfg, scores_dir, workspace_dir, output_base, args.container_timeout, args.debug)
+                        nf = executor.submit(run_single, html_id, args.scaffolding, model_cfg, scores_dir, workspace_dir, output_base, args.container_timeout, args.debug, args.claude_debug)
                         pending[nf] = html_id
 
                 if _stop_event.is_set() and not pending:
