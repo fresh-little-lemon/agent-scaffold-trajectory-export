@@ -1,5 +1,7 @@
 # Claude Code Transcript, API Trace, and Swift JSONL
 
+> **Superseded 2026-10-26** for request reconstruction: the transcript's `api-request`/shape/blob records rebuild every non-compaction request exactly, and the compaction `<analysis>` can only come from run-time capture. See `docs/transcript_to_calls.md`. Kept for the field-level notes on the first converter.
+
 ## 结论先行
 
 `transcript`、`API trace` 和 `Swift JSONL` 不是严格的集合包含关系。

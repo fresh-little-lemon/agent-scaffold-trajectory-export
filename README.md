@@ -1,6 +1,34 @@
 # Claude Code trajectory export
 
-Remote working directory: `/home/tsq/workspace/agent-scaffold-trajectory-export`.
+Run an agent scaffold (Claude Code 2.1.310) on tasks with any model, keep the whole workspace, and turn every model
+call it made into ms-swift agent SFT data, using only the workspace's `.claude/`. A capture proxy records all API
+traffic byte-exact as the ground truth for auditing.
+
+Remote working directory: `/home/tsq/workspace/agent-scaffold-trajectory-export` (A800; a git work tree fed from
+the bare repo next to it: `git push a800 main` locally, then `git pull` there).
+
+## Pipeline (2026-10-26)
+
+| Step | Tool | Doc |
+|---|---|---|
+| run tasks in isolated containers, capture all API traffic, keep every attempt | `e2e/run_batch.py --config e2e/run_config_*.json` | `docs/run_layout.md` |
+| capture proxy (write-ahead, survives kills, flags proxy-made errors and truncation) | `e2e/api_proxy.py` | `docs/api_capture.md` |
+| readable trace: requests + SSE folded into non-streaming responses | `rebuild_wire_jsonl.py` | `docs/api_capture.md` |
+| rebuild every call (exact request + response) from the transcript alone | `transcript_to_calls.py` | `docs/transcript_to_calls.md` |
+| prove it against the trace | `audit_calls_vs_trace.py` | `docs/transcript_to_calls.md` |
+| ms-swift rows, loss on each call's own response, optional exact chain merge | `calls_to_swift.py`, then `e2e/prepare_megatron_dataset.py` | `docs/transcript_to_calls.md` |
+
+Result on the 2026-10-26 DeepSeek-V4.1-Flash runs: every request rebuilt from the transcript equals the wire
+request (messages incl. cache_control, system, tools, params); responses equal except one Bash command whose
+`cd <cwd> && ` prefix Claude Code strips. The only calls the transcript cannot give are compaction calls (summary
+kept, `<analysis>` not stored) and calls that never finished.
+
+Tests: `python -m pytest -q tests` (unit); `tests/e2e_capture/` (experiments against a real vLLM / Claude Code).
+
+## History (before 2026-10-26)
+
+The rest of this file describes the first converter, `claude_jsonl_to_swift.py` (one row per session), which
+`transcript_to_calls.py` + `calls_to_swift.py` supersede.
 
 `claude_jsonl_to_swift.py` converts Claude Code native session JSONL into
 ms-swift Agent JSONL while streaming large inputs. It merges repeated assistant
