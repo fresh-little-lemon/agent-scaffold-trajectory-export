@@ -145,6 +145,9 @@ def run_item(item: dict, cfg: dict, model_cfg: dict, model_out: Path) -> dict:
            "-v", f"{item_root}:/app/outputs/{SCAFFOLD}/{model}",
            "-v", f"{item['video']}:/data/input/source.mp4:ro",
            "-v", f"{REPO / 'e2e' / 'api_proxy.py'}:/opt/api_proxy.py:ro",
+           # npm's content-addressed cache is safe to share and turns repeated installs of the same
+           # template packages into local copies (the mirror needs minutes per cold install).
+           *(["-v", f"{cfg['npm_cache_dir']}:/home/node/.npm"] if cfg.get("npm_cache_dir") else []),
            IMAGE, "bash", "-c", container_command(item, model, upstream, cfg.get("skill", "media2threejs"))]
     started = time.time()
     record = {"id": iid, **{k: v for k, v in item.items() if k != "id"}, "started_at": rb.utc_stamp(started)}
@@ -223,6 +226,9 @@ def main() -> int:
     GOAL_TEMPLATE = (REPO / cfg["goal_template"]).read_text(encoding="utf-8")
     model_out = Path(cfg["output_base"]) / SCAFFOLD / model_cfg["model_name"]
     model_out.mkdir(parents=True, exist_ok=True)
+    if cfg.get("npm_cache_dir"):
+        Path(cfg["npm_cache_dir"]).mkdir(parents=True, exist_ok=True)
+        os.chmod(cfg["npm_cache_dir"], 0o777)
     items = [json.loads(line) for line in Path(cfg["items"]).read_text(encoding="utf-8").splitlines() if line.strip()]
     if args.limit:
         items = items[:args.limit]
