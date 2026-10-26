@@ -1,0 +1,13 @@
+{
+  "scaffolding": "claude_code",
+  "model_config": "/home/tsq/workspace/agent-scaffold-trajectory-export/e2e/model_config_deepseek_v41.json",
+  "html_ids": ["401"],
+  "concurrent": 1,
+  "capture": true,
+  "claude_debug": true,
+  "archive_attempts": true,
+  "output_base": "/home/tsq/workspace/agent-scaffold-trajectory-export/e2e/outputs-20261026-stop-test",
+  "container_timeout": 1800,
+  "max_retry_rounds": 0,
+  "track_tokens": false
+}
