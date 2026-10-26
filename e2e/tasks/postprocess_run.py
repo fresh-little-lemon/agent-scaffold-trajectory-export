@@ -121,6 +121,15 @@ def main() -> int:
                  "results_dir": str(item_root / "results" / iid), "scene_dir": str(ws / "project" / "scene"),
                  "transcripts": str(ws / ".claude" / "projects"), "trace": str(trace),
                  "calls": str(train / "calls.jsonl"), "train": str(train / "train.jsonl")}
+        done_marker = item_root / "postprocess.json"
+        if done_marker.is_file():
+            prev = json.loads(done_marker.read_text())
+            if prev.get("record") == rec:  # same run outcome as last time: reuse
+                entry["metrics"] = prev.get("metrics")
+                errors.extend(prev.get("errors", []))
+                index.append(entry)
+                continue
+        item_errors_start = len(errors)
         try:
             run("transcript_to_calls.py", "--workspace", str(ws), "--out", str(train / "calls.jsonl"))
             conv = json.loads(run("calls_to_swift.py", str(train / "calls.jsonl"), str(train / "train.jsonl"),
@@ -143,6 +152,8 @@ def main() -> int:
                     recon.unlink()  # regenerable; 10s of MB per item
             entry["metrics"] = metrics
             (item_root / "metrics.json").write_text(json.dumps(metrics, ensure_ascii=False, indent=2))
+            done_marker.write_text(json.dumps({"record": rec, "metrics": metrics,
+                                               "errors": errors[item_errors_start:]}, ensure_ascii=False))
         except Exception as exc:
             errors.append({"id": iid, "source": "postprocess", "error": repr(exc)[:800]})
         index.append(entry)
