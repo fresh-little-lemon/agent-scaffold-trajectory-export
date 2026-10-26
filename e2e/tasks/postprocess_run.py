@@ -167,9 +167,25 @@ def main() -> int:
     if args.vllm_container:
         logs = subprocess.run(["docker", "logs", "--since", "24h", args.vllm_container],
                               capture_output=True, text=True, errors="replace")
+        # One record per error event: a traceback is many ERROR lines with the same timestamp; keep its
+        # first line and its exception message, and count repeats of the same message.
+        events: dict[str, dict] = {}
+        current = None
         for line in (logs.stdout + logs.stderr).splitlines():
-            if " ERROR " in line or "Traceback" in line or "CUDA out of memory" in line:
-                errors.append({"source": "vllm", "line": line[:500]})
+            if " ERROR " not in line and "Traceback" not in line:
+                current = None
+                continue
+            stamp = line.split(" ERROR ")[0][-24:]
+            if current is None or current["stamp"] != stamp:
+                current = {"stamp": stamp, "first": line[:300], "message": ""}
+            text = line.split("] ", 1)[-1].strip()
+            if text and ("Error" in text or "Exception" in text) and not text.startswith("File "):
+                current["message"] = text[:400]
+                key = current["message"] or current["first"]
+                rec = events.setdefault(key, {"source": "vllm", "message": key, "count": 0, "first_at": stamp})
+                rec["count"] += 1
+                rec["last_at"] = stamp
+        errors.extend(events.values())
     with (out / "errors.jsonl").open("w", encoding="utf-8") as f:
         for e in errors:
             f.write(json.dumps(e, ensure_ascii=False) + "\n")

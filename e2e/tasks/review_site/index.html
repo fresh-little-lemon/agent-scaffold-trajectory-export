@@ -1,0 +1,210 @@
+<title>Chem Video Whitebox Review</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans+Condensed:wght@500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+/* Layout: lab-notebook report. Run summary strip, then one numbered sample per section; each sample pairs the
+   side-by-side render with its numbers, then a call explorer with request / response / training in three panes. */
+:root {
+  --bg: #f3f5f7;
+  --panel: #ffffff;
+  --ink: #17202a;
+  --muted: #5b6876;
+  --line: #d7dde4;
+  --accent: #1f5fa8;
+  --accent-soft: #e3edf8;
+  --train: #0e7a5f;
+  --train-soft: #e1f3ec;
+  --warn: #a35a00;
+  --warn-soft: #fbefdc;
+  --bad: #b3261e;
+  --bad-soft: #f9e3e1;
+  --code-bg: #f6f8fa;
+  --f-display: "IBM Plex Sans Condensed", "Arial Narrow", system-ui, sans-serif;
+  --f-body: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --f-mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0f141a; --panel: #161d25; --ink: #e6ebf0; --muted: #98a5b3; --line: #2a3542;
+    --accent: #7fb2ec; --accent-soft: #1b2d42; --train: #5ccfa8; --train-soft: #12332a;
+    --warn: #f0b35c; --warn-soft: #3a2b14; --bad: #f2867e; --bad-soft: #3d1c1a; --code-bg: #121820;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0f141a; --panel: #161d25; --ink: #e6ebf0; --muted: #98a5b3; --line: #2a3542;
+  --accent: #7fb2ec; --accent-soft: #1b2d42; --train: #5ccfa8; --train-soft: #12332a;
+  --warn: #f0b35c; --warn-soft: #3a2b14; --bad: #f2867e; --bad-soft: #3d1c1a; --code-bg: #121820;
+  color-scheme: dark;
+}
+body { background: var(--bg); color: var(--ink); font-family: var(--f-body); font-size: 15px; line-height: 1.55; }
+.wrap { max-width: 1240px; margin: 0 auto; padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px)); padding-block: 28px 64px; display: grid; gap: 36px; }
+h1, h2, h3 { font-family: var(--f-display); text-wrap: balance; margin: 0; line-height: 1.2; }
+h1 { font-size: 30px; font-weight: 600; }
+h2 { font-size: 22px; font-weight: 600; }
+h3 { font-size: 15px; font-weight: 600; letter-spacing: .02em; }
+.lede { color: var(--muted); max-width: 72ch; margin: 6px 0 0; }
+.label { font-family: var(--f-mono); font-size: 11.5px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.num { font-family: var(--f-mono); font-variant-numeric: tabular-nums; }
+a { color: var(--accent); }
+.summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 1px; background: var(--line);
+  border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+.summary > div { background: var(--panel); padding: 12px 14px; display: grid; gap: 2px; min-width: 0; }
+.summary .v { font-family: var(--f-mono); font-size: 20px; font-variant-numeric: tabular-nums; }
+.summary .s { color: var(--muted); font-size: 12.5px; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip { font-family: var(--f-mono); font-size: 12px; padding: 2px 8px; border-radius: 999px; background: var(--accent-soft); color: var(--accent); }
+.chip.ok { background: var(--train-soft); color: var(--train); }
+.chip.warn { background: var(--warn-soft); color: var(--warn); }
+.chip.bad { background: var(--bad-soft); color: var(--bad); }
+section.sample { display: grid; gap: 16px; padding-top: 22px; border-top: 2px solid var(--ink); }
+.sample-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 8px 20px; }
+.sample-head h2 { min-width: 0; flex: 1 1 420px; }
+.meta { color: var(--muted); font-size: 13px; }
+.media { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); gap: 16px; align-items: start; }
+@media (max-width: 860px) { .media { grid-template-columns: 1fr; } }
+video, .still { width: 100%; max-width: 100%; border-radius: 4px; background: #000; display: block; }
+.caption { display: flex; justify-content: space-between; font-size: 12px; color: var(--muted); margin-top: 6px; font-family: var(--f-mono); }
+table.kv { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+table.kv td { padding: 5px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
+table.kv td:last-child { text-align: right; font-family: var(--f-mono); font-variant-numeric: tabular-nums; }
+details.readme { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 10px 14px; }
+details.readme pre { white-space: pre-wrap; font-family: var(--f-mono); font-size: 12.5px; margin: 10px 0 0; max-height: 360px; overflow: auto; }
+.tabs { display: flex; flex-wrap: wrap; gap: 6px; }
+.tabs button { font: inherit; font-size: 13px; padding: 5px 12px; border-radius: 4px; border: 1px solid var(--line);
+  background: var(--panel); color: var(--ink); cursor: pointer; }
+.tabs button[aria-selected="true"] { background: var(--ink); color: var(--panel); border-color: var(--ink); }
+.tabs button:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.panes { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+@media (max-width: 1000px) { .panes { grid-template-columns: 1fr; } }
+.pane { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; min-width: 0; display: grid; grid-template-rows: auto 1fr; }
+.pane > header { padding: 10px 12px; border-bottom: 1px solid var(--line); display: grid; gap: 4px; }
+.pane .body { padding: 10px 12px; display: grid; gap: 8px; max-height: 560px; overflow: auto; align-content: start; }
+.msg { border-left: 3px solid var(--line); padding: 2px 0 2px 10px; display: grid; gap: 4px; min-width: 0; }
+.msg.assistant, .msg.tool_call { border-left-color: var(--accent); }
+.msg.trained { border-left-color: var(--train); background: var(--train-soft); }
+.msg.this { outline: 2px solid var(--train); outline-offset: 2px; }
+.role { font-family: var(--f-mono); font-size: 11.5px; color: var(--muted); display: flex; gap: 8px; flex-wrap: wrap; }
+pre.c { margin: 0; white-space: pre-wrap; word-break: break-word; font-family: var(--f-mono); font-size: 12px;
+  background: var(--code-bg); padding: 6px 8px; border-radius: 3px; max-height: 260px; overflow: auto; }
+.kind { font-family: var(--f-mono); font-size: 11px; color: var(--accent); }
+.kind.thinking { color: var(--muted); }
+.note { font-size: 12.5px; color: var(--muted); }
+.errors { overflow-x: auto; }
+.errors table { border-collapse: collapse; width: 100%; font-size: 12.5px; }
+.errors td, .errors th { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+.errors td.c { font-family: var(--f-mono); max-width: 640px; word-break: break-word; }
+#status { color: var(--muted); }
+@media (prefers-reduced-motion: no-preference) { .tabs button { transition: background .12s; } }
+</style>
+
+<div class="wrap">
+  <header>
+    <div class="label">media2threejs · Claude Code 2.1.310 · DeepSeek-V4.1-Flash on 8×A800</div>
+    <h1>Chem Video Whitebox Review</h1>
+    <p class="lede">Each sample is a 10-second clip from a chemistry experiment video, rebuilt by the agent as a white-model Three.js scene. Below each render, pick a model call to see the request and response captured on the wire next to the training row built from the transcript alone; the call's own trained span is outlined.</p>
+  </header>
+  <div id="status">Loading run data…</div>
+  <div id="summary"></div>
+  <div id="samples" style="display:grid;gap:44px"></div>
+  <section id="errors"></section>
+</div>
+
+<script>
+const fmt = (n, d = 0) => n == null ? "–" : Number(n).toLocaleString("en-US", { maximumFractionDigits: d, minimumFractionDigits: d });
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const mins = s => s == null ? "–" : (s / 60).toFixed(1) + " min";
+
+function summary(stats) {
+  const m = stats.mean_per_successful_item || {};
+  const st = stats.status || {};
+  const cells = [
+    ["Items run", fmt(stats.items), Object.entries(st).map(([k, v]) => `${k} ${v}`).join(" · ")],
+    ["Succeeded", fmt(stats.successful_items), "whitebox.mp4 on disk and probed"],
+    ["Wall time / item", mins(m.elapsed_s), "container start to exit"],
+    ["Model time / item", mins(m.model_time_s), "sum of /v1/messages durations"],
+    ["Model calls / item", fmt(m.calls), `${fmt(m.messages_requests)} wire requests`],
+    ["Input tokens / item", fmt(m.input_tokens), `${fmt(m.cache_read_input_tokens)} cache-read`],
+    ["Output tokens / item", fmt(m.output_tokens), "incl. thinking"],
+    ["Training rows", fmt(stats.train_rows), `${fmt(m.trained_responses)} trained responses / item`],
+  ];
+  return `<div class="summary">${cells.map(([l, v, s]) => `<div><span class="label">${esc(l)}</span><span class="v">${v}</span><span class="s">${esc(s)}</span></div>`).join("")}</div>`;
+}
+
+function block(b) {
+  const head = b.type === "tool_use" ? `tool_use · ${esc(b.name)}` : b.type === "tool_result" ? `tool_result${b.is_error ? " · error" : ""}` : esc(b.type);
+  const text = b.type === "tool_use" ? b.input : b.text;
+  return `<div><div class="kind ${b.type}">${head}</div><pre class="c">${esc(text)}</pre></div>`;
+}
+
+function pane(title, sub, html) {
+  return `<div class="pane"><header><h3>${title}</h3><div class="note">${sub}</div></header><div class="body">${html}</div></div>`;
+}
+
+function callView(c) {
+  const r = c.request;
+  const req = `<div class="note">${fmt(r.message_count)} messages; the first ${fmt(r.earlier_messages)} repeat the previous request and its response, so only the new ones are shown. System: ${r.system.length} blocks (${fmt(r.system.reduce((a, b) => a + b.chars, 0))} chars). Tools: ${r.tools.length}.</div>
+    <details><summary class="note">Parameters, system head, tool names</summary><pre class="c">${esc(JSON.stringify(r.params, null, 1))}</pre><pre class="c">${esc(r.system.map(s => s.head).join("\n---\n"))}</pre><pre class="c">${esc(r.tools.join(", "))}</pre></details>
+    ${r.new_messages.map(m => `<div class="msg ${m.role}"><div class="role">${esc(m.role)}</div>${m.blocks.map(block).join("")}</div>`).join("")}`;
+  const resp = `<div class="msg assistant"><div class="role">assistant · stop_reason ${esc(c.stop_reason)}</div>${c.response.map(block).join("")}</div>`;
+  const t = c.training;
+  const train = t ? `<div class="note">Row ${t.row_index} holds ${t.row_calls} chained calls (${t.row_messages} messages, ${t.tools} tools, system ${fmt(t.system_chars)} chars); this call is #${t.position_in_row + 1}. Showing messages ${t.window_start + 1}–${t.window_start + t.window.length}. Green = loss on; outlined = this call's response.</div>
+    ${t.window.map(m => `<div class="msg ${m.role} ${m.loss ? "trained" : ""} ${m.this_call ? "this" : ""}"><div class="role"><span>${esc(m.role)}</span>${m.loss ? "<span>loss: true</span>" : ""}</div><pre class="c">${esc(m.content)}</pre></div>`).join("")}` : `<div class="note">Not in the training data (skipped call).</div>`;
+  const u = c.usage || {};
+  return `<div class="chips"><span class="chip">wire #${esc(c.wire_sequence)}</span><span class="chip ${c.wire_capture === "complete" ? "ok" : "warn"}">${esc(c.wire_capture)}</span><span class="chip">${fmt(c.wire_duration_s, 1)} s</span><span class="chip">in ${fmt(u.input_tokens)} · out ${fmt(u.output_tokens)}</span><span class="chip">${esc(c.query_source)}</span></div>
+    <div class="panes">${pane("Wire request", "captured by the proxy", req)}${pane("Wire response", "SSE folded into one message", resp)}${pane("Training row", "ms-swift, built from the transcript only", train)}</div>`;
+}
+
+function sample(it, n) {
+  const m = it.metrics || {};
+  const a = m.audit || {};
+  const audit = a.calls != null ? `${a.matched}/${a.calls} calls matched; ${a.messages_exact} exact messages; ${a.response_exact} exact responses` : "–";
+  const clipEnd = (it.clip_start + it.clip_seconds).toFixed(1);
+  const video = it.media["compare.mp4"] ? `<video controls muted playsinline preload="metadata" poster="${esc(it.media["compare.jpg"] || "")}" src="${esc(it.media["compare.mp4"])}"></video>`
+    : it.media["compare.jpg"] ? `<img class="still" src="${esc(it.media["compare.jpg"])}" alt="reference and white model, side by side">` : `<div class="note">No render.</div>`;
+  const tabs = it.calls.map((c, i) => `<button role="tab" id="t-${it.id}-${i}" aria-selected="${i === 0}" data-i="${i}">Call ${c.line ? "line " + c.line : i + 1} · ${esc(c.stop_reason)}</button>`).join("");
+  return `<section class="sample" id="s-${esc(it.id)}">
+    <div class="sample-head"><h2>${n}. ${esc(it.title)}</h2><span class="chip ${it.status === "success" ? "ok" : "bad"}">${esc(it.status)}</span></div>
+    <div class="meta num">${esc(it.id)} · clip ${it.clip_start.toFixed(1)}–${clipEnd} s · ${it.url ? `<a href="${esc(it.url)}" target="_blank" rel="noopener">source video</a>` : ""}</div>
+    <div class="media"><div>${video}<div class="caption"><span>reference</span><span>white model</span></div></div>
+      <table class="kv"><tbody>
+        <tr><td>Wall time</td><td>${mins(m.elapsed_s)}</td></tr>
+        <tr><td>Model time</td><td>${mins(m.model_time_s)}</td></tr>
+        <tr><td>Model calls</td><td>${fmt(m.calls)}</td></tr>
+        <tr><td>Input tokens</td><td>${fmt(m.input_tokens)}</td></tr>
+        <tr><td>Output tokens</td><td>${fmt(m.output_tokens)}</td></tr>
+        <tr><td>Training rows</td><td>${fmt(m.train_rows)} (${fmt(m.trained_responses)} responses)</td></tr>
+        <tr><td>Transcript vs wire</td><td>${esc(audit)}</td></tr>
+      </tbody></table></div>
+    ${it.readme ? `<details class="readme"><summary class="label">Agent's README for this reconstruction</summary><pre>${esc(it.readme)}</pre></details>` : ""}
+    <div class="tabs" role="tablist">${tabs}</div>
+    <div class="callview">${it.calls.length ? callView(it.calls[0]) : ""}</div>
+    <details class="readme"><summary class="label">Where the files are</summary><pre>${esc(Object.entries(it.paths).map(([k, v]) => `${k}: ${v}`).join("\n"))}</pre></details>
+  </section>`;
+}
+
+function errors(e) {
+  const rows = e.examples.map(x => `<tr><td>${esc(x.source)}</td><td class="num">${esc(x.id || "")}</td><td class="c">${esc(JSON.stringify(Object.fromEntries(Object.entries(x).filter(([k]) => !["source", "id"].includes(k)))))}</td></tr>`).join("");
+  return `<h2>Errors</h2><p class="lede">${Object.entries(e.by_source).map(([k, v]) => `${k}: ${v}`).join(" · ") || "none recorded"}</p>
+    ${rows ? `<div class="errors"><table><thead><tr><th class="label">Source</th><th class="label">Item</th><th class="label">Detail</th></tr></thead><tbody>${rows}</tbody></table></div>` : ""}`;
+}
+
+fetch("data.json").then(r => r.json()).then(data => {
+  document.getElementById("status").hidden = true;
+  document.getElementById("summary").innerHTML = summary(data.stats);
+  const host = document.getElementById("samples");
+  host.innerHTML = data.items.map((it, i) => sample(it, i + 1)).join("");
+  data.items.forEach(it => {
+    const sec = document.getElementById("s-" + it.id);
+    sec.querySelector(".tabs").addEventListener("click", ev => {
+      const b = ev.target.closest("button"); if (!b) return;
+      sec.querySelectorAll(".tabs button").forEach(x => x.setAttribute("aria-selected", x === b));
+      sec.querySelector(".callview").innerHTML = callView(it.calls[+b.dataset.i]);
+    });
+  });
+  document.getElementById("errors").innerHTML = errors(data.errors);
+}).catch(err => { document.getElementById("status").textContent = "Could not load data.json: " + err; });
+</script>
