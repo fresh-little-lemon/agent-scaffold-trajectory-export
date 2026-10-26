@@ -1,3 +1,8 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Chem Video Whitebox Review</title>
 <meta name="claude:viewport-fit-sides" content="cover">
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -39,6 +44,7 @@
   --warn: #f0b35c; --warn-soft: #3a2b14; --bad: #f2867e; --bad-soft: #3d1c1a; --code-bg: #121820;
   color-scheme: dark;
 }
+html, body { margin: 0; }
 body { background: var(--bg); color: var(--ink); font-family: var(--f-body); font-size: 15px; line-height: 1.55; }
 .wrap { max-width: 1240px; margin: 0 auto; padding-left: max(16px, env(safe-area-inset-left, 0px));
   padding-right: max(16px, env(safe-area-inset-right, 0px)); padding-block: 28px 64px; display: grid; gap: 36px; }
@@ -100,7 +106,8 @@ pre.c { margin: 0; white-space: pre-wrap; word-break: break-word; font-family: v
 #status { color: var(--muted); }
 @media (prefers-reduced-motion: no-preference) { .tabs button { transition: background .12s; } }
 </style>
-
+</head>
+<body>
 <div class="wrap">
   <header>
     <div class="label">media2threejs · Claude Code 2.1.310 · DeepSeek-V4.1-Flash on 8×A800</div>
@@ -208,3 +215,5 @@ fetch("data.json").then(r => r.json()).then(data => {
   document.getElementById("errors").innerHTML = errors(data.errors);
 }).catch(err => { document.getElementById("status").textContent = "Could not load data.json: " + err; });
 </script>
+</body>
+</html>

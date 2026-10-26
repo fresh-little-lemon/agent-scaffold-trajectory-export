@@ -17,6 +17,7 @@ the bare repo next to it: `git push a800 main` locally, then `git pull` there).
 | rebuild every call (exact request + response) from the transcript alone | `transcript_to_calls.py` | `docs/transcript_to_calls.md` |
 | prove it against the trace | `audit_calls_vs_trace.py` | `docs/transcript_to_calls.md` |
 | ms-swift rows, loss on each call's own response, optional exact chain merge | `calls_to_swift.py`, then `e2e/prepare_megatron_dataset.py` | `docs/transcript_to_calls.md` |
+| generic file-based tasks (one container per item, `/goal`, Stop-hook check), post-processing, review page | `e2e/run_tasks.py`, `e2e/tasks/` | `docs/media2threejs_task.md` |
 
 Result on the 2026-10-26 DeepSeek-V4.1-Flash runs: every request rebuilt from the transcript equals the wire
 request (messages incl. cache_control, system, tools, params); responses equal except one Bash command whose
