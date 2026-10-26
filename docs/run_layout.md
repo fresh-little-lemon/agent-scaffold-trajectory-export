@@ -36,6 +36,17 @@ reaches Claude Code and the proxy (see `docs/api_capture.md` for why `docker kil
 worse). Verified 2026-10-26: SIGUSR1 to the batch stopped item 401 in 6 s, `exit_code: 143`,
 `stopped_by: batch_stop`, and the proxy journaled the 4 calls in flight.
 
+Pitfall (A800, 2026-10-26): after item 14's processes had all exited, the docker daemon hung on every request
+about its container (`docker stop`, `inspect`, `top`, `exec`), while `docker ps` and other containers were fine.
+The batch then waited forever in `docker stop`. Stops are now bounded (`timeout`) and logged; such a container
+needs root to clear. The item's data was complete; it was archived by hand.
+
+Full smoke run 2026-10-26 (items 13, 14, concurrency 2, new pipeline): both scored; item 14 rebuilt from the
+transcript alone matched the trace on all 218 calls (messages incl. cache_control, system, tools, params), 211/214
+responses equal (3 = stripped `cd <dir> && ` prefix), 8 compaction calls (main + subagents) only in the trace,
+2 streams cancelled by Claude Code itself recorded as `client_disconnected`. Item 14 attempt: 141 MB on disk,
+20 MB as tar.zst (screenshots and recordings dominate).
+
 ## Versioning: what to version, at what granularity
 
 | What | How | Why |

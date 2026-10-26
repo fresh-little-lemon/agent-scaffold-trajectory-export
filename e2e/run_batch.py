@@ -63,12 +63,21 @@ def _handle_stop_signal(signum, frame):
     threading.Thread(target=_kill_own_containers, daemon=True).start()
 
 def _kill_own_containers(extra_filter: str = ""):
-    """Stop (SIGTERM, then SIGKILL after DOCKER_STOP_TIMEOUT s) only this batch's containers."""
-    result = subprocess.run(
-        f"docker ps --filter label={_BATCH_LABEL} {extra_filter} -q "
-        f"| xargs -r -n1 -P20 docker stop -t {DOCKER_STOP_TIMEOUT}",
-        shell=True, capture_output=True, text=True,
-    )
+    """Stop (SIGTERM, then SIGKILL after DOCKER_STOP_TIMEOUT s) only this batch's containers.
+
+    Bounded: a container whose state the docker daemon cannot resolve makes `docker stop`
+    hang forever (seen on the A800, 2026-10-26); log it and move on instead of blocking the batch.
+    """
+    try:
+        result = subprocess.run(
+            f"docker ps --filter label={_BATCH_LABEL} {extra_filter} -q "
+            f"| xargs -r -n1 -P20 timeout {DOCKER_STOP_TIMEOUT + 60} docker stop -t {DOCKER_STOP_TIMEOUT}",
+            shell=True, capture_output=True, text=True, timeout=DOCKER_STOP_TIMEOUT + 120,
+        )
+    except subprocess.TimeoutExpired:
+        log.warning(f"docker stop did not return (label={_BATCH_LABEL} {extra_filter}); "
+                    "a container may be stuck in the docker daemon, leaving it")
+        return
     stopped = result.stdout.strip().splitlines()
     if stopped:
         log.info(f"Stopped {len(stopped)} containers (label={_BATCH_LABEL} {extra_filter})".rstrip())
