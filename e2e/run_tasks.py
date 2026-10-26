@@ -123,6 +123,10 @@ def run_item(item: dict, cfg: dict, model_cfg: dict, model_out: Path) -> dict:
               item_root / "results", item_root / "results" / iid):
         os.chmod(p, 0o777)
     (item_root / "goal.txt").write_text(render_goal(GOAL_TEMPLATE, item, model), encoding="utf-8")
+    if cfg.get("stop_hook"):
+        # Deterministic completion check next to /goal's conversation-only evaluator.
+        (run_home / ".claude" / "settings.json").write_text(json.dumps({"hooks": {"Stop": [{"hooks": [
+            {"type": "command", "command": f"python3 /opt/hooks/{Path(cfg['stop_hook']).name}"}]}]}}, indent=2))
     (item_root / "item.json").write_text(json.dumps(item, ensure_ascii=False, indent=2), encoding="utf-8")
 
     upstream = model_cfg["anthropic_base_url"].replace("127.0.0.1", "host.docker.internal").replace(
@@ -131,9 +135,11 @@ def run_item(item: dict, cfg: dict, model_cfg: dict, model_out: Path) -> dict:
            "http_proxy": "", "https_proxy": "", "HTTP_PROXY": "", "HTTPS_PROXY": "", "all_proxy": "", "ALL_PROXY": "",
            "npm_config_registry": cfg.get("npm_registry", "https://registry.npmmirror.com"),
            "PIP_INDEX_URL": cfg.get("pip_index", "https://mirrors.aliyun.com/pypi/simple/")}
-    if model_cfg.get("context_window"):
-        env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(model_cfg["context_window"])
+    window = cfg.get("auto_compact_window") or model_cfg.get("context_window")
+    if window:
+        env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(window)
         env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] = str(cfg.get("autocompact_pct", 60))
+    env["M2T_RESULTS_DIR"] = f"/app/outputs/{SCAFFOLD}/{model}/results/{iid}"
     env.update(rb.build_claude_code_env(model, model_cfg.get("api_key", "EMPTY"),
                                         f"http://127.0.0.1:{rb.IN_CONTAINER_PROXY_PORT}", cfg.get("claude_env")))
     cmd = ["docker", "run", "--rm", "--init", "--name", f"rt_{os.getpid()}_{iid}"[:63],
@@ -148,6 +154,7 @@ def run_item(item: dict, cfg: dict, model_cfg: dict, model_out: Path) -> dict:
            # npm's content-addressed cache is safe to share and turns repeated installs of the same
            # template packages into local copies (the mirror needs minutes per cold install).
            *(["-v", f"{cfg['npm_cache_dir']}:/home/node/.npm"] if cfg.get("npm_cache_dir") else []),
+           *(["-v", f"{(REPO / cfg['stop_hook']).parent}:/opt/hooks:ro"] if cfg.get("stop_hook") else []),
            IMAGE, "bash", "-c", container_command(item, model, upstream, cfg.get("skill", "media2threejs"))]
     started = time.time()
     record = {"id": iid, **{k: v for k, v in item.items() if k != "id"}, "started_at": rb.utc_stamp(started)}
