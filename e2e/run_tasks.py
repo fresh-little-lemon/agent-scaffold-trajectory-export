@@ -57,9 +57,12 @@ def on_signal(signum, _frame):
     threading.Thread(target=stop_containers, daemon=True).start()
 
 
-def render_goal(template: str, item: dict, model: str) -> str:
+def render_goal(template: str, item: dict, model: str, timeout_s: int = 5400) -> str:
+    now = time.time()
+    hhmm = lambda t: time.strftime("%H:%M", time.gmtime(t))  # noqa: E731
     fields = {**item, "model": model, "results": f"/app/outputs/{SCAFFOLD}/{model}/results/{item['id']}",
-              "clip": f"/home/node/project/input/{item['id']}.mp4"}
+              "clip": f"/home/node/project/input/{item['id']}.mp4", "start_utc": hhmm(now),
+              "first_deliverable_utc": hhmm(now + timeout_s * 0.55), "hard_stop_utc": hhmm(now + timeout_s)}
     text = template.format(**fields)
     if len(text) > 4000:
         raise ValueError(f"goal condition for {item['id']} is {len(text)} chars; /goal allows 4000")
@@ -122,7 +125,7 @@ def run_item(item: dict, cfg: dict, model_cfg: dict, model_out: Path) -> dict:
     for p in (run_home, item_root, item_root / "traces", item_root / "traces" / "log",
               item_root / "results", item_root / "results" / iid):
         os.chmod(p, 0o777)
-    (item_root / "goal.txt").write_text(render_goal(GOAL_TEMPLATE, item, model), encoding="utf-8")
+    (item_root / "goal.txt").write_text(render_goal(GOAL_TEMPLATE, item, model, cfg.get("container_timeout", 5400)), encoding="utf-8")
     if cfg.get("stop_hook"):
         # Deterministic completion check next to /goal's conversation-only evaluator.
         (run_home / ".claude" / "settings.json").write_text(json.dumps({"hooks": {"Stop": [{"hooks": [
