@@ -9,6 +9,25 @@ import json
 from pathlib import Path
 
 
+def _json_object(text: str):
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _append_to_tool_response(target: dict, key: str, text: str) -> None:
+    """Attach text to a tool response: a field of the JSON envelope (claude_jsonl_to_swift.py rows)
+    or appended to the raw tool output (calls_to_swift.py rows, which keep what the model saw)."""
+    envelope = _json_object(target["content"])
+    if envelope is None:
+        target["content"] += "\n\n" + text
+        return
+    envelope.setdefault(key, []).append(text)
+    target["content"] = json.dumps(envelope, ensure_ascii=False)
+
+
 def merge_system_reminders(messages: list[dict]) -> tuple[list[dict], list[dict]]:
     """Keep model-visible reminders while respecting Swift's turn/message schema."""
     normalized = []
@@ -17,10 +36,7 @@ def merge_system_reminders(messages: list[dict]) -> tuple[list[dict], list[dict]
         message = dict(original)
         if message["role"] != "system":
             if message["role"] == "user" and normalized and normalized[-1]["role"] == "tool_response":
-                target = normalized[-1]
-                response = json.loads(target["content"])
-                response.setdefault("followup_user_messages", []).append(message["content"])
-                target["content"] = json.dumps(response, ensure_ascii=False)
+                _append_to_tool_response(normalized[-1], "followup_user_messages", message["content"])
                 audit.append({
                     "source_message_index": index,
                     "placement": "preceding_tool_response",
@@ -50,9 +66,7 @@ def merge_system_reminders(messages: list[dict]) -> tuple[list[dict], list[dict]
             normalized.append({"role": "user", "content": content})
 
         if placement in {"preceding_tool_response", "following_tool_response"}:
-            response = json.loads(target["content"])
-            response.setdefault("system_reminders", []).append(content)
-            target["content"] = json.dumps(response, ensure_ascii=False)
+            _append_to_tool_response(target, "system_reminders", content)
         audit.append({
             "source_message_index": index,
             "placement": placement,
@@ -96,7 +110,7 @@ def main() -> int:
                 if role not in allowed_roles or not isinstance(content, str):
                     raise ValueError(f"row {line_number} has an invalid message: {message!r}")
                 image_tokens += content.count("<image>")
-                if role in {"tool_call", "tool_response"}:
+                if role == "tool_call":
                     json.loads(content)
             messages[:], system_reminder_records = merge_system_reminders(messages)
 
@@ -106,7 +120,7 @@ def main() -> int:
             omitted_terminal_tool_responses = []
             while messages and messages[-1].get("role") == "tool_response":
                 content = messages.pop().get("content", "")
-                response = json.loads(content)
+                response = _json_object(content) or {}
                 omitted_terminal_tool_responses.append({
                     "tool_use_id": response.get("tool_use_id"),
                     "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
