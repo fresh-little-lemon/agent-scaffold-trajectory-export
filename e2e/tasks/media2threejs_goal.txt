@@ -8,4 +8,6 @@ The goal is met only when all of these hold, each shown in this conversation:
 3. {results}/compare.mp4 shows the reference (left) and the white-model render (right) side by side for the whole clip (ffmpeg hstack), and {results}/compare.jpg is a side-by-side still from the middle of the clip.
 4. {results}/README.md lists what was modeled, how the camera and motion were matched, and what is approximate.
 
-Network: npm and pip work through mirrors already configured; there is no other internet access. Do not ask questions; decide and proceed. Or stop after 80 turns.
+Network: npm and pip work through mirrors already configured; there is no other internet access. Do not ask questions; decide and proceed.
+
+Working order (there is a hard time limit of about 80 minutes): first get ALL four deliverables on disk at blockout fidelity within your first ~40 tool calls: simple primitives for the main apparatus, an approximate static camera, the main motion, a frame-by-frame render script, whitebox.mp4, compare.mp4, compare.jpg, README.md. Use the skill's video-scene route for this, but skip optional precision gates (exact camera solving, landmark fitting, layout-contract validation) until the deliverables exist. Then use the remaining time to improve fidelity by comparing frames, re-rendering and overwriting the deliverables. Or stop after 80 turns.

@@ -5,7 +5,7 @@
   "items": "/home/tsq/workspace/agent-scaffold-trajectory-export/e2e/tasks/chem_scale.jsonl",
   "goal_template": "e2e/tasks/media2threejs_goal.txt",
   "output_base": "/home/tsq/workspace/agent-scaffold-trajectory-export/e2e/3d-code-gen",
-  "concurrent": 24,
+  "concurrent": 32,
   "container_timeout": 5400,
   "cpus_per_item": 6,
   "drop_node_modules": true,
@@ -14,5 +14,6 @@
   "launch_interval_s": 5,
   "stop_hook": "e2e/tasks/hooks/require_deliverables.py",
   "auto_compact_window": 200000,
-  "autocompact_pct": 80
+  "autocompact_pct": 80,
+  "effort": "medium"
 }

@@ -66,7 +66,7 @@ def render_goal(template: str, item: dict, model: str) -> str:
     return text
 
 
-def container_command(item: dict, model: str, upstream: str, skill: str) -> str:
+def container_command(item: dict, model: str, upstream: str, skill: str, extra_flags: str = "") -> str:
     out = f"/app/outputs/{SCAFFOLD}/{model}"
     iid = item["id"]
     clip = (f"ffmpeg -nostdin -loglevel error -y -ss {float(item.get('clip_start', 0))} "
@@ -78,7 +78,7 @@ def container_command(item: dict, model: str, upstream: str, skill: str) -> str:
         + f"mkdir -p /home/node/.claude/skills /home/node/project/input {out}/results/{iid} && "
         f"rm -rf /home/node/.claude/skills/{skill} && cp -r /opt/skills/{skill} /home/node/.claude/skills/ && "
         f"{clip} && cd /home/node/project && "
-        f"claude -p \"$(cat {out}/goal.txt)\" --dangerously-skip-permissions "
+        f"claude -p \"$(cat {out}/goal.txt)\" --dangerously-skip-permissions {extra_flags}"
         f"--output-format stream-json --verbose > {out}/traces/log/{iid}.claude.stream.jsonl 2>&1; "
         f"echo \"claude_exit=$?\" > {out}/traces/log/{iid}.exit"
     )
@@ -155,7 +155,8 @@ def run_item(item: dict, cfg: dict, model_cfg: dict, model_out: Path) -> dict:
            # template packages into local copies (the mirror needs minutes per cold install).
            *(["-v", f"{cfg['npm_cache_dir']}:/home/node/.npm"] if cfg.get("npm_cache_dir") else []),
            *(["-v", f"{(REPO / cfg['stop_hook']).parent}:/opt/hooks:ro"] if cfg.get("stop_hook") else []),
-           IMAGE, "bash", "-c", container_command(item, model, upstream, cfg.get("skill", "media2threejs"))]
+           IMAGE, "bash", "-c", container_command(item, model, upstream, cfg.get("skill", "media2threejs"),
+                                                  f"--effort {cfg['effort']} " if cfg.get("effort") else "")]
     started = time.time()
     record = {"id": iid, **{k: v for k, v in item.items() if k != "id"}, "started_at": rb.utc_stamp(started)}
     log.info(f"[{iid}] start ({item.get('title', '')[:40]})")
