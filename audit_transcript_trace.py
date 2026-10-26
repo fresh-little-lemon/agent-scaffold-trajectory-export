@@ -284,12 +284,24 @@ def wire_trace_summary(path: Path) -> dict[str, Any]:
             if streaming and record.get("response_status") and int(record["response_status"]) < 400 and not parsed["terminal"]:
                 incomplete_streams.append({"line": line_number, "n": record.get("n"),
                                            "protocol": protocol, "reason": "missing_terminal_event"})
+    # Schema-3 proxies journal every exchange before it finishes; a start with no trace
+    # record is an exchange cut off by the proxy dying (its partial bodies are on disk).
+    interrupted = []
+    journal = path.with_name(path.name + ".journal.jsonl")
+    if journal.is_file():
+        finished = {(str(r.get("proxy_run_id") or ""), r.get("n")) for _, r in iter_jsonl(path)}
+        for _, event in iter_jsonl(journal):
+            if (event.get("event") == "exchange_start"
+                    and (str(event.get("proxy_run_id") or ""), event.get("n")) not in finished):
+                interrupted.append({"proxy_run_id": event.get("proxy_run_id"), "n": event.get("n"),
+                                    "target": event.get("request_target")})
     return {
         "format": "wire-v2",
         "trace": str(path),
         "wire_records": records,
         "complete_records": complete,
         "error_records": errors,
+        "interrupted_exchanges": interrupted,
         "missing_body_files": missing_files,
         "body_integrity_mismatches": integrity_mismatches,
         "status_counts": dict(status_counts),
