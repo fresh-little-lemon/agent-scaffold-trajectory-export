@@ -55,3 +55,27 @@ system, tools, params). Responses differed only where Claude Code strips a leadi
 Bash commands before storing them (10-39 per item, because the agent's working directory is `project`); later
 requests send the stripped form back, so the training rows are consistent with what the model saw afterwards. Each
 item had 4-6 compaction calls, which only the trace has.
+
+## Run 2026-10-26/27 (106 items, 32 concurrent, 90 min limit per attempt)
+
+Numbers from `dataset/stats.json` at 23:05 UTC (the last 17 items finish by about 00:05 UTC; `e2e/tasks/finish_run.sh`
+then stops the runner before its retry rounds and runs the final post-processing).
+
+| | value |
+|---|---|
+| items with a white-model video | 64 of 105 recorded (61 of the 106 scale items) |
+| wall time per successful item | 87.8 min (agents keep refining until the stop time stated in the goal) |
+| model time per successful item | 82.1 min (sum of `/v1/messages` durations) |
+| model calls per successful item | 63 |
+| input tokens per successful item | 3.57 M (each call's full prompt summed; vLLM prefix-cache hit rate about 90%) |
+| output tokens per successful item | 64 k |
+| transcript vs trace | every rebuilt call matched its wire request exactly (messages, system, tools, params) |
+| vLLM throughput at 32 agents | 30-37 running requests, 450-1100 generated tokens/s, KV cache 5-21% |
+| storage | about 150 MB per item (mostly the agents' rendered frame PNGs), 21 GB for the run |
+
+Yield by setting: 3/10 with the first goal text; 25/36 in the first scale wave after the Stop hook and the
+deliverables-first order; 21/32 then 23/32 in later waves with the clock times in the goal. Failures are mostly
+timeouts with a scene but no final render.
+
+Review page: `e2e/3d-code-gen/review_site/` on the A800 (served with `python3 -m http.server 8791` there; from the
+local machine through `ssh -L 8791:127.0.0.1:8791 maic_a800_80_2`).
