@@ -14,3 +14,5 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .backup-*/
+# task run outputs (large; on the server only)
+e2e/3d-code-gen/

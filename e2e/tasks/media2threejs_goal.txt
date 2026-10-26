@@ -1,0 +1,11 @@
+Use the media2threejs skill (installed at /home/node/.claude/skills/media2threejs; read its SKILL.md first and follow its video-scene route and state graph) to rebuild the reference clip {clip} as a Three.js scene. The clip is {clip_seconds:.0f} seconds of a chemistry lab video ("{title}"). Work in /home/node/project.
+
+Deliver a WHITE-MODEL (clay) reconstruction: every mesh uses plain white or light-grey materials, no textures, no colours, no image planes. Match the reference's camera framing and camera motion, the layout and proportions of the visible apparatus (glassware, stands, burners, bottles, hands only as simple proxies), and the main motions over the clip (pouring, moving objects, flames, bubbles or liquid levels as simple animated geometry). Hidden parts are approximations.
+
+The goal is met only when all of these hold, each shown in this conversation:
+1. The Three.js source (TypeScript or JavaScript) is in /home/node/project/scene and builds or loads without errors (show the build or a headless-browser console check with no errors).
+2. {results}/whitebox.mp4 exists, rendered from that Three.js scene frame by frame in headless Chromium (Python playwright is installed; browsers are at $PLAYWRIGHT_BROWSERS_PATH; use --use-gl=angle --use-angle=swiftshader for WebGL) and encoded with ffmpeg, with the same duration (within 1 second) and aspect ratio as the reference. Show ffprobe output for both files.
+3. {results}/compare.mp4 shows the reference (left) and the white-model render (right) side by side for the whole clip (ffmpeg hstack), and {results}/compare.jpg is a side-by-side still from the middle of the clip.
+4. {results}/README.md lists what was modeled, how the camera and motion were matched, and what is approximate.
+
+Network: npm and pip work through mirrors already configured; there is no other internet access. Do not ask questions; decide and proceed. Or stop after 80 turns.
