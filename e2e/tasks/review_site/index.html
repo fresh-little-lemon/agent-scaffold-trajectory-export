@@ -116,6 +116,7 @@ pre.c { margin: 0; white-space: pre-wrap; word-break: break-word; font-family: v
   </header>
   <div id="status">Loading run data…</div>
   <div id="summary"></div>
+  <p class="note" id="summary-note">Averages are over items that produced a video. A run is stopped at 90 minutes; most successful agents keep refining until then, so wall time is close to the limit by design.</p>
   <div id="samples" style="display:grid;gap:44px"></div>
   <section id="errors"></section>
 </div>
@@ -134,7 +135,7 @@ function summary(stats) {
     ["Wall time / item", mins(m.elapsed_s), "container start to exit"],
     ["Model time / item", mins(m.model_time_s), "sum of /v1/messages durations"],
     ["Model calls / item", fmt(m.calls), `${fmt(m.messages_requests)} wire requests`],
-    ["Input tokens / item", fmt(m.input_tokens), `${fmt(m.cache_read_input_tokens)} cache-read`],
+    ["Input tokens / item", fmt(m.input_tokens), "each call's full prompt, summed; vLLM served ~90% from its prefix cache"],
     ["Output tokens / item", fmt(m.output_tokens), "incl. thinking"],
     ["Training rows", fmt(stats.train_rows), `${fmt(m.trained_responses)} trained responses / item`],
   ];

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -79,7 +80,7 @@ def transcode(src: Path, dst: Path, image: str) -> bool:
         return False
     dst.parent.mkdir(parents=True, exist_ok=True)
     r = subprocess.run(["docker", "run", "--rm", "--network", "none", "-v", f"{src.parent}:/i:ro",
-                        "-v", f"{dst.parent}:/o", "--user", "0", "--entrypoint", "ffmpeg", image, "-nostdin",
+                        "-v", f"{dst.parent}:/o", "--user", f"{os.getuid()}:{os.getgid()}", "--entrypoint", "ffmpeg", image, "-nostdin",
                         "-loglevel", "error", "-y", "-i", f"/i/{src.name}", "-vf", "scale=-2:360", "-c:v", "libx264",
                         "-crf", "30", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-an", "-movflags", "+faststart",
                         f"/o/{dst.name}"], capture_output=True, text=True, timeout=600)
