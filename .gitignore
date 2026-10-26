@@ -1,0 +1,16 @@
+# run outputs and local copies of Claude Code data (large, regenerable, may hold private sessions)
+e2e/outputs*/
+outputs*/
+local-claude-*/
+local_claude_snapshot/
+audit-*/
+smoke/
+# vendored upstream repo (has its own .git) and downloaded release tarballs
+deepseek-recipe/
+*.tgz
+*.tar.gz
+# python / editor / scratch
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.backup-*/

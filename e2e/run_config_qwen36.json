@@ -1,0 +1,12 @@
+{
+  "scaffolding": "claude_code",
+  "model_config": "/home/tsq/workspace/agent-scaffold-trajectory-export/e2e/model_config_qwen36.json",
+  "html_ids": [401],
+  "concurrent": 1,
+  "debug": true,
+  "claude_debug": true,
+  "output_base": "/home/tsq/workspace/agent-scaffold-trajectory-export/e2e/outputs-20261025-qwen36",
+  "container_timeout": 3600,
+  "max_retry_rounds": 0,
+  "track_tokens": false
+}

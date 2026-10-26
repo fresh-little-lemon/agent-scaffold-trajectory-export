@@ -1,0 +1,14 @@
+FROM eval-interact-review-claude-code:latest
+
+# Keep the evaluation image's browser/MCP configuration and replace only the
+# Claude Code native binary. The Linux optional package is staged on the host
+# because Docker's build network cannot reach the native installer endpoint.
+COPY anthropic-ai-claude-code-linux-x64-2.1.310.tgz /tmp/claude-code-linux.tgz
+USER root
+RUN rm -rf /opt/claude-code \
+    && mkdir -p /opt/claude-code \
+    && tar -xzf /tmp/claude-code-linux.tgz -C /opt/claude-code --strip-components=1 \
+    && chmod +x /opt/claude-code/claude \
+    && ln -sfn /opt/claude-code/claude /usr/local/bin/claude \
+    && claude --version
+USER node

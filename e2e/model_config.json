@@ -1,0 +1,22 @@
+{
+  "model_name": "qwen3.8-27b",
+  "api_key": "EMPTY",
+  "openai_base_url": "http://127.0.0.1:8108/v1",
+  "anthropic_base_url": "http://127.0.0.1:8108",
+  "context_window": 120000,
+  "thinking": {
+    "thinking_switch": true,
+    "method": "extra_body",
+    "on": {
+      "chat_template_kwargs": {
+        "enable_thinking": true
+      }
+    },
+    "off": {
+      "chat_template_kwargs": {
+        "enable_thinking": false
+      }
+    },
+    "default": "thinking"
+  }
+}
