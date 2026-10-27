@@ -51,12 +51,15 @@ def from_shots(args, skip):
     db = sqlite3.connect(f"file:{catalogs[-1]}?mode=ro", uri=True)
     title_filter = " and ".join(["i.title like ?"] * len(args.keyword)) or "1"
     rows = db.execute(f"""
-        select c.clip_id, c.key, c.t0, c.t1, c.scores, f.path, i.title, i.duration, i.width, i.height, i.platform, i.meta
-        from clips c join items i on i.key = c.key join files f on f.key = c.key
+        select c.clip_id, c.key, c.f0, c.f1, c.scores, c.path, i.title, i.duration, i.width, i.height, i.platform, i.meta,
+               c.t0, c.t1
+        from clips c join items i on i.key = c.key
         where {title_filter} and i.duration between ? and ?""",
         [f"%{k}%" for k in args.keyword] + [args.min_duration, args.max_duration]).fetchall()
     best: dict[str, tuple] = {}
-    for clip_id, key, t0, t1, scores, path, title, duration, width, height, platform, meta in rows:
+    # A video can be stored as several partial files (raw/.../<id>.s<offset>.mp4); a clip's f0/f1 are seconds
+    # inside its own file c.path, t0/t1 seconds in the whole video. Cut with f0/f1 from c.path.
+    for clip_id, key, t0, t1, scores, path, title, duration, width, height, platform, meta, v0, v1 in rows:
         if key in skip:
             continue
         s = json.loads(scores or "{}")
@@ -67,17 +70,18 @@ def from_shots(args, skip):
         if not (args.root / path).is_file():
             continue
         if key not in best or dur > best[key][3] - best[key][2]:
-            best[key] = (clip_id, key, float(t0), float(t1), s, path, title, duration, width, height, platform, meta)
+            best[key] = (clip_id, key, float(t0), float(t1), s, path, title, duration, width, height, platform, meta,
+                         float(v0), float(v1))
     picked = sorted(best.values(), key=lambda b: (b[1], b[0]))
     if args.limit:
         picked = picked[:args.limit]
-    for clip_id, key, t0, t1, s, path, title, duration, width, height, platform, meta in picked:
+    for clip_id, key, t0, t1, s, path, title, duration, width, height, platform, meta, v0, v1 in picked:
         clip = min(args.clip_seconds, t1 - t0)
         start = t0 + (t1 - t0 - clip) / 2
         url = (json.loads(meta or "{}") or {}).get("url")
         yield {"id": clip_id, "video_key": key, "video": str(args.root / path), "title": title,
                "duration_s": duration, "width": width, "height": height, "platform": platform, "url": url,
-               "shot_t0": t0, "shot_t1": t1, "shot_scores": s,
+               "file_t0": t0, "file_t1": t1, "video_t0": v0, "video_t1": v1, "shot_scores": s,
                "clip_start": round(start, 3), "clip_seconds": round(clip, 3)}
 
 
