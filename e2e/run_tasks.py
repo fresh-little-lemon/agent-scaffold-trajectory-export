@@ -69,21 +69,38 @@ def render_goal(template: str, item: dict, model: str, timeout_s: int = 5400) ->
     return text
 
 
-def container_command(item: dict, model: str, upstream: str, skill: str, extra_flags: str = "") -> str:
+def container_command(item: dict, model: str, upstream: str, skill: str, extra_flags: str = "",
+                      max_resumes: int = 5) -> str:
+    """Prepare the input, then run Claude in an attempt loop.
+
+    Attempt 1 starts the session with the /goal; later attempts resume the same session (`--continue`) and set
+    the goal again. After each attempt hooks/attempt_outcome.py decides: success, fail_fatal, fail_stalled, or
+    resume (with backoff 60 s, 120 s, ... up to 15 min). The outcome of every attempt goes to <id>.outcomes.jsonl.
+    """
     out = f"/app/outputs/{SCAFFOLD}/{model}"
     iid = item["id"]
+    log_dir = f"{out}/traces/log"
+    stream = f"{log_dir}/{iid}.claude.stream.jsonl"
     clip = (f"ffmpeg -nostdin -loglevel error -y -ss {float(item.get('clip_start', 0))} "
             f"-t {float(item['clip_seconds'])} -i /data/input/source.mp4 -an -c:v libx264 -preset veryfast "
             f"-crf 20 -pix_fmt yuv420p /home/node/project/input/{iid}.mp4")
+    claude = f"claude --dangerously-skip-permissions {extra_flags}--output-format stream-json --verbose"
     return (
         "umask 0000 && "
         + rb.build_proxy_start(SCAFFOLD, model, iid, upstream)
         + f"mkdir -p /home/node/.claude/skills /home/node/project/input {out}/results/{iid} && "
         f"rm -rf /home/node/.claude/skills/{skill} && cp -r /opt/skills/{skill} /home/node/.claude/skills/ && "
         f"{clip} && cd /home/node/project && "
-        f"claude -p \"$(cat {out}/goal.txt)\" --dangerously-skip-permissions {extra_flags}"
-        f"--output-format stream-json --verbose > {out}/traces/log/{iid}.claude.stream.jsonl 2>&1; "
-        f"echo \"claude_exit=$?\" > {out}/traces/log/{iid}.exit"
+        f"attempt=0; delay=60; decision=resume; "
+        f"while [ \"$decision\" = resume ] && [ $attempt -le {max_resumes} ]; do "
+        f"attempt=$((attempt+1)); start=$(stat -c %s {stream} 2>/dev/null || echo 0); "
+        f"if [ $attempt -eq 1 ]; then {claude} -p \"$(cat {out}/goal.txt)\" >> {stream} 2>&1; "
+        f"else sleep $delay; delay=$((delay*2 > 900 ? 900 : delay*2)); "
+        f"{claude} --continue -p \"$(cat {out}/goal.txt)\" >> {stream} 2>&1; fi; rc=$?; "
+        f"decision=$(python3 /opt/hooks/attempt_outcome.py {stream} $start {out}/results/{iid} "
+        f"{log_dir}/{iid}.outcomes.jsonl $attempt $rc); "
+        f"done; [ \"$decision\" = resume ] && decision=gave_up; "
+        f"echo \"$decision\" > {log_dir}/{iid}.exit"
     )
 
 
@@ -159,22 +176,34 @@ def run_item(item: dict, cfg: dict, model_cfg: dict, model_out: Path) -> dict:
            *(["-v", f"{cfg['npm_cache_dir']}:/home/node/.npm"] if cfg.get("npm_cache_dir") else []),
            *(["-v", f"{(REPO / cfg['stop_hook']).parent}:/opt/hooks:ro"] if cfg.get("stop_hook") else []),
            IMAGE, "bash", "-c", container_command(item, model, upstream, cfg.get("skill", "media2threejs"),
-                                                  f"--effort {cfg['effort']} " if cfg.get("effort") else "")]
+                                                  f"--effort {cfg['effort']} " if cfg.get("effort") else "",
+                                                  cfg.get("max_resumes", 5))]
     started = time.time()
     record = {"id": iid, **{k: v for k, v in item.items() if k != "id"}, "started_at": rb.utc_stamp(started)}
     log.info(f"[{iid}] start ({item.get('title', '')[:40]})")
     proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
     stopped_by = "exited"
+    # No fixed working-time limit: the item runs while it makes progress. Progress = the capture journal grows
+    # (every model call writes to it). Stopped only when nothing happened for `hang_minutes`, or at the
+    # `container_timeout` safety limit.
+    journal = item_root / "traces" / f"{iid}.jsonl.journal.jsonl"
+    hang_s = cfg.get("hang_minutes", 60) * 60
+    last_size, last_change = -1, time.time()
+    while proc.poll() is None:
+        time.sleep(30)
+        size = journal.stat().st_size if journal.is_file() else 0
+        if size != last_size:
+            last_size, last_change = size, time.time()
+        idle = time.time() - last_change
+        if idle > hang_s or time.time() - started > cfg.get("container_timeout", 86400):
+            stopped_by = "hung" if idle > hang_s else "timeout"
+            log.warning(f"[{iid}] {stopped_by}: no model call for {idle / 60:.0f} min, stopping")
+            stop_containers(f"--filter label=rb_item={iid}")
+            break
     try:
-        _, err = proc.communicate(timeout=cfg.get("container_timeout", 5400))
+        _, err = proc.communicate(timeout=rb.DOCKER_STOP_TIMEOUT + 90)
     except subprocess.TimeoutExpired:
-        stopped_by = "timeout"
-        log.warning(f"[{iid}] timeout after {cfg.get('container_timeout')} s, stopping")
-        stop_containers(f"--filter label=rb_item={iid}")
-        try:
-            _, err = proc.communicate(timeout=rb.DOCKER_STOP_TIMEOUT + 90)
-        except subprocess.TimeoutExpired:
-            err = "docker client did not exit after stop"
+        err = "docker client did not exit after stop"
     if _stop.is_set() and stopped_by == "exited":
         stopped_by = "batch_stop"
     elapsed = time.time() - started
@@ -189,7 +218,17 @@ def run_item(item: dict, cfg: dict, model_cfg: dict, model_out: Path) -> dict:
         "whitebox_s": ffprobe_duration(results / "whitebox.mp4"),
         "compare_s": ffprobe_duration(results / "compare.mp4"),
     })
-    record["status"] = "success" if record["whitebox_s"] else ("timeout" if stopped_by == "timeout" else "no_video")
+    outcomes = item_root / "traces" / "log" / f"{iid}.outcomes.jsonl"
+    record["attempts"] = [json.loads(l) for l in _read(outcomes).splitlines() if l.strip()]
+    decision = (record["claude_exit"] or "").strip()
+    if record["whitebox_s"] and decision == "success":
+        record["status"] = "success"
+    elif stopped_by in ("hung", "timeout", "batch_stop"):
+        record["status"] = stopped_by
+    elif decision in ("fail_fatal", "fail_stalled", "gave_up"):
+        record["status"] = decision
+    else:
+        record["status"] = "no_video"
     if cfg.get("drop_node_modules", True):
         # Regenerable from package.json/package-lock.json; ~100+ MB per project.
         for nm in run_home.glob("project/**/node_modules"):
@@ -198,7 +237,7 @@ def run_item(item: dict, cfg: dict, model_cfg: dict, model_out: Path) -> dict:
                 record.setdefault("dropped", []).append(str(nm.relative_to(run_home)))
     record["workspace_mb"] = round(_du(run_home) / 2**20, 1)
     record["item_mb"] = round(_du(item_root) / 2**20, 1)
-    log.info(f"[{iid}] {record['status']} in {elapsed:.0f}s, exit={proc.returncode} {record['claude_exit']}, "
+    log.info(f"[{iid}] {record['status']} in {elapsed:.0f}s, attempts={len(record['attempts'])}, "
              f"whitebox={record['whitebox_s']}s, ws={record['workspace_mb']}MB")
     if cfg.get("archive_attempts"):
         rb.archive_attempt(model_out, iid)

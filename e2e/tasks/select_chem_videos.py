@@ -85,6 +85,38 @@ def from_shots(args, skip):
                "clip_start": round(start, 3), "clip_seconds": round(clip, 3)}
 
 
+def from_videos(args, skip):
+    """Whole videos: triage passed (lab content), downloaded as one file covering the full duration.
+
+    Partial downloads (several raw/.../<id>.s<offset>.mp4 files) are skipped: they are not a complete video.
+    Shortest first, so results arrive early. Item id = video key; the clip is the whole file.
+    """
+    import sqlite3
+    catalogs = sorted((args.root / "_state" / "backup").glob("catalog-*.sqlite"))
+    db = sqlite3.connect(f"file:{catalogs[-1]}?mode=ro", uri=True)
+    rows = db.execute("""
+        select i.key, i.title, i.duration, i.width, i.height, i.platform, i.meta, s.result, f.path, f.duration
+        from items i join stages s on s.key = i.key and s.stage = 'triage' and s.status = 'done'
+        join files f on f.key = i.key
+        where i.key in (select key from files group by key having count(*) = 1)""").fetchall()
+    picked = []
+    for key, title, duration, width, height, platform, meta, triage, path, fdur in rows:
+        if key in skip or not fdur or not duration or float(fdur) < 0.95 * float(duration):
+            continue
+        if not (args.min_duration <= float(fdur) <= args.max_duration):
+            continue
+        tri = json.loads(triage or "{}")
+        if not tri.get("pass", True):
+            continue
+        picked.append({"id": key, "video_key": key, "video": str(args.root / path), "title": title,
+                       "duration_s": float(fdur), "width": width, "height": height, "platform": platform,
+                       "url": (json.loads(meta or "{}") or {}).get("url"),
+                       "lab_segments": tri.get("segments"), "lab_fraction": tri.get("lab_fraction"),
+                       "clip_start": 0.0, "clip_seconds": round(float(fdur), 3)})
+    picked.sort(key=lambda r: (r["duration_s"], r["id"]))
+    return picked[:args.limit] if args.limit else picked
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--root", type=Path, default=DATASET)
@@ -99,19 +131,21 @@ def main() -> int:
     ap.add_argument("--from-shots", action="store_true",
                     help="one shot per video from the dataset catalog's clips table (no scene cut inside a clip)")
     ap.add_argument("--min-shot", type=float, default=4.0, help="shortest usable shot, seconds")
+    ap.add_argument("--from-videos", action="store_true",
+                    help="whole videos (triage passed, one complete file), shortest first")
     ap.add_argument("--limit", type=int)
     ap.add_argument("--out", type=Path, required=True)
     args = ap.parse_args()
 
     skip = {json.loads(l).get("video_key", json.loads(l)["id"])
             for f in args.exclude for l in f.read_text(encoding="utf-8").splitlines() if l.strip()}
-    if args.from_shots:
-        rows = list(from_shots(args, skip))
+    if args.from_shots or args.from_videos:
+        rows = list(from_videos(args, skip) if args.from_videos else from_shots(args, skip))
         args.out.parent.mkdir(parents=True, exist_ok=True)
         with args.out.open("w", encoding="utf-8", newline="\n") as out:
             for r in rows:
                 out.write(json.dumps(r, ensure_ascii=False) + "\n")
-        print(f"{len(rows)} shot items -> {args.out}")
+        print(f"{len(rows)} items -> {args.out}")
         return 0
 
     pool = {}

@@ -190,7 +190,8 @@ def main() -> int:
             if current is None or current["stamp"] != stamp:
                 current = {"stamp": stamp, "first": line[:300], "message": ""}
             text = line.split("] ", 1)[-1].strip()
-            if text and ("Error" in text or "Exception" in text) and not text.startswith("File "):
+            if (text and ("Error" in text or "Exception" in text) and not text.startswith("File ")
+                    and not text.startswith("raise ")):  # "raise X(" is a traceback line, not the message
                 current["message"] = text[:400]
                 key = current["message"] or current["first"]
                 rec = events.setdefault(key, {"source": "vllm", "message": key, "count": 0, "first_at": stamp})

@@ -79,3 +79,26 @@ timeouts with a scene but no final render.
 
 Review page: `e2e/3d-code-gen/review_site/` on the A800 (served with `python3 -m http.server 8791` there; from the
 local machine through `ssh -L 8791:127.0.0.1:8791 maic_a800_80_2`).
+
+## Change 2026-10-27: whole videos, attempt loop, finer outcomes
+
+- **Input is the whole video** (`select_chem_videos.py --from-videos`): triage passed, one downloaded file covering
+  the full duration (partial multi-file downloads skipped), shortest first. No clip cap. The goal text tells the
+  agent the video can contain several shots and title cards. The earlier 10 s clips (fixed window, then middle of
+  a shot) are kept as attempts but are not what we want.
+- **No working-time limit.** The container runs `claude -p "/goal ..."`, then after every attempt
+  `hooks/attempt_outcome.py` decides: `success` (deliverables + "Refinement" section present), `fail_fatal`
+  (auth error, 400/401/403/404/413, "unrecoverable error"), `fail_stalled` (two attempts in a row with < 3 tool
+  calls), or `resume` (anything else: `claude --continue` the same session with the goal set again, backoff 60 s
+  doubling to 15 min, at most `max_resumes` resumes, then `gave_up`). Each attempt is a line in
+  `traces/log/<id>.outcomes.jsonl`.
+- The host stops an item only when no model call happened for `hang_minutes` (status `hung`) or at the 24 h safety
+  limit (`timeout`).
+- Claude Code's stream watchdog gave up on slow streams under load (one item failed with "The response stopped
+  arriving" after three 440-480 s streams): `CLAUDE_STREAM_IDLE_TIMEOUT_MS=1800000`, `API_TIMEOUT_MS=3600000`.
+
+## TODO
+
+- Semantic segmentation into 15 s / 10 s / 5 s pieces **after** the white model of the whole video exists: re-enter
+  the same image and `claude --resume` the item's session to add the step, so the segmentation becomes part of the
+  same trajectory. Not started.
