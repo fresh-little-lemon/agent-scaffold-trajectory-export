@@ -217,6 +217,7 @@ class ItemWatchdog:
             nxt = {p for p, pp, _ in procs if pp in frontier and p not in children and p not in claude}
             children |= nxt
             frontier = nxt
+        self.claude_pids, self.child_pids = sorted(claude), sorted(children)
         total, now = 0, {}
         for pid in children:
             try:
@@ -296,15 +297,23 @@ class ItemWatchdog:
         return None
 
     def _act(self, level: int, state: str) -> str:
+        """Signal processes by host pid (from `docker top`; the containers run as the batch's own uid), so the
+        image needs no procps."""
+        import signal
         if level == 1 and state in ("tool", "background"):
-            # Kill Claude's child process trees (stuck tools / background tasks); Claude itself keeps going.
-            cmd = "for p in $(pgrep -f 'claude --dangerously'); do pkill -TERM -P $p; done"
+            targets = list(reversed(getattr(self, "child_pids", [])))   # stuck tools / background tasks only
         elif level == 2:
-            cmd = "pkill -TERM -f 'claude --dangerously'"  # the attempt loop resumes the session
+            targets = getattr(self, "claude_pids", [])                  # the attempt loop resumes the session
         else:
             return "none"
-        subprocess.run(["docker", "exec", self.container, "sh", "-c", cmd], capture_output=True, timeout=60)
-        return cmd
+        killed = []
+        for pid in targets:
+            try:
+                os.kill(pid, signal.SIGTERM)
+                killed.append(pid)
+            except OSError:
+                pass
+        return f"SIGTERM {killed}"
 
     def close(self) -> None:
         self.registry.set(self.iid, None)
