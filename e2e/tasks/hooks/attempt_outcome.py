@@ -3,7 +3,7 @@
 
 Reads the attempt's events from the stream-json log (from byte offset START to the end), checks the deliverables,
 appends one record to OUTCOMES and prints the decision word on stdout:
-  success       all deliverables present
+  success       all deliverables present (how much to refine beyond that is the agent's call)
   fail_fatal    an error Claude Code itself cannot get past (auth, 4xx request errors, goal cleared after an
                 unrecoverable error)
   fail_stalled  this attempt and the one before made (almost) no tool calls: /goal is not moving
@@ -37,8 +37,6 @@ def main() -> int:
     status = result.get("api_error_status")
     results = Path(results)
     deliverables = all((results / n).is_file() and (results / n).stat().st_size >= s for n, s in REQUIRED.items())
-    if deliverables and "refinement" not in (results / "README.md").read_text(errors="replace").lower():
-        deliverables = False
     previous = [json.loads(l) for l in Path(outcomes).read_text().splitlines()] if Path(outcomes).is_file() else []
 
     if deliverables:

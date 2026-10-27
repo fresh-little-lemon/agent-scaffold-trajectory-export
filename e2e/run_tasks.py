@@ -33,6 +33,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import run_batch as rb  # noqa: E402  (helpers: proxy start, env, attempts, archives)
+from watchdog import ItemWatchdog, Registry  # noqa: E402
 
 log = rb.log
 REPO = Path(__file__).resolve().parent.parent
@@ -183,23 +184,30 @@ def run_item(item: dict, cfg: dict, model_cfg: dict, model_out: Path) -> dict:
     log.info(f"[{iid}] start ({item.get('title', '')[:40]})")
     proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
     stopped_by = "exited"
-    # No fixed working-time limit: the item runs while it makes progress. Progress = the capture journal grows
-    # (every model call writes to it). Stopped only when nothing happened for `hang_minutes`, or at the
-    # `container_timeout` safety limit.
-    journal = item_root / "traces" / f"{iid}.jsonl.journal.jsonl"
-    hang_s = cfg.get("hang_minutes", 60) * 60
-    last_size, last_change = -1, time.time()
-    while proc.poll() is None:
-        time.sleep(30)
-        size = journal.stat().st_size if journal.is_file() else 0
-        if size != last_size:
-            last_size, last_change = size, time.time()
-        idle = time.time() - last_change
-        if idle > hang_s or time.time() - started > cfg.get("container_timeout", 86400):
-            stopped_by = "hung" if idle > hang_s else "timeout"
-            log.warning(f"[{iid}] {stopped_by}: no model call for {idle / 60:.0f} min, stopping")
-            stop_containers(f"--filter label=rb_item={iid}")
-            break
+    # No fixed working-time limit: a heartbeat watchdog (e2e/watchdog.py) follows what the agent is doing and
+    # how long its silences usually last. In "shadow" mode it only logs; the item is then stopped only after
+    # `hang_minutes` without any progress, or at the `container_timeout` safety limit.
+    wd = ItemWatchdog(iid, f"rt_{os.getpid()}_{iid}"[:63], item_root, run_home / "project", REGISTRY,
+                      mode=cfg.get("watchdog_mode", "shadow"), floor_s=cfg.get("watchdog_floor_s", 600),
+                      cap_s=cfg.get("watchdog_cap_s", 3600))
+    hang_s = cfg.get("hang_minutes", 240) * 60
+    interval = 30
+    try:
+        while proc.poll() is None:
+            time.sleep(interval)
+            try:
+                verdict = wd.poll(interval)
+            except Exception as exc:  # the watchdog must never take the item down
+                log.warning(f"[{iid}] watchdog error: {exc!r}")
+                verdict = None
+            idle = time.time() - wd.silence_start
+            if verdict == "hung" or idle > hang_s or time.time() - started > cfg.get("container_timeout", 86400):
+                stopped_by = "hung" if verdict == "hung" or idle > hang_s else "timeout"
+                log.warning(f"[{iid}] {stopped_by}: no progress for {idle / 60:.0f} min, stopping")
+                stop_containers(f"--filter label=rb_item={iid}")
+                break
+    finally:
+        wd.close()
     try:
         _, err = proc.communicate(timeout=rb.DOCKER_STOP_TIMEOUT + 90)
     except subprocess.TimeoutExpired:
@@ -290,6 +298,8 @@ def main() -> int:
     if not wait_upstream(model_cfg["anthropic_base_url"]):
         log.error(f"model server {model_cfg['anthropic_base_url']} not reachable")
         return 2
+    global REGISTRY
+    REGISTRY = Registry(model_cfg["anthropic_base_url"].rstrip("/") + "/health")
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGUSR1, on_signal)
     manifest = {"created_at": rb.utc_stamp(), "argv": sys.argv, "host": socket.gethostname(),
@@ -332,6 +342,7 @@ def main() -> int:
 
 IMAGE = ""
 GOAL_TEMPLATE = ""
+REGISTRY = Registry(None)
 
 if __name__ == "__main__":
     raise SystemExit(main())

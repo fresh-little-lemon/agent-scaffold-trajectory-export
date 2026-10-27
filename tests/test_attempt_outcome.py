@@ -28,9 +28,8 @@ def tool_turns(n):
     return [{"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Bash"}]}}] * n
 
 
-def test_success_needs_refinement_section(tmp_path):
-    assert run(tmp_path, tool_turns(5), deliver=True) == "success"
-    assert run(tmp_path, tool_turns(5), deliver=True, refinement=False) == "resume"
+def test_success_when_deliverables_present(tmp_path):
+    assert run(tmp_path, tool_turns(5), deliver=True, refinement=False) == "success"
 
 
 def test_fatal_api_error(tmp_path):

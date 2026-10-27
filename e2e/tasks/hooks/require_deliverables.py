@@ -25,9 +25,6 @@ def main() -> int:
     results = Path(os.environ.get("M2T_RESULTS_DIR", ""))
     missing = [f"{name} (needs >= {size} bytes)" for name, size in REQUIRED.items()
                if not (results / name).is_file() or (results / name).stat().st_size < size]
-    readme = results / "README.md"
-    if readme.is_file() and "refinement" not in readme.read_text(errors="replace").lower():
-        missing.append('a "Refinement" section in README.md (the comparison-and-fix round)')
     if not missing or not str(results):
         return 0
     counter = Path(tempfile.gettempdir()) / f"stop_blocks_{event.get('session_id', 'x')}"

@@ -102,3 +102,26 @@ local machine through `ssh -L 8791:127.0.0.1:8791 maic_a800_80_2`).
 - Semantic segmentation into 15 s / 10 s / 5 s pieces **after** the white model of the whole video exists: re-enter
   the same image and `claude --resume` the item's session to add the step, so the segmentation becomes part of the
   same trajectory. Not started.
+
+## Hang detection (2026-10-27, `e2e/watchdog.py`)
+
+Measured on the earlier runs (`tests/serving_perf/silence_gaps.py`): model calls take p50 22 s, p95 7.7 min,
+max 46 min under load; agent work between calls p99 83 s, max 9 min; response headers arrive in < 3 s (vLLM answers
+before prefill, so time to first byte says nothing). A per-session "mean + 4 sd" timeout on wall time would flag 4%
+of normal gaps, up to 63x over. So the watchdog judges progress, not time:
+
+- **State** comes from Claude Code's own stream-json events: model call in flight (proxy journal), foreground
+  tool (`tool_use` without `tool_result`), background task (`task_started` / `task_updated` is_backgrounded /
+  `task_notification`), or idle.
+- **Progress** = a stream byte (the proxy flushes every chunk), a new or finished model call, a tool result, a
+  finished task, or a new file in the project (directory mtimes only, the workspace is on NFS). CPU is not
+  progress: a busy loop burns CPU forever; per-process CPU of Claude's child processes (from /proc, attributed via
+  `docker top`) only doubles the patience for a busy tool or background task. Other users' load does not leak in.
+- **Threshold** per item and state: mean + 4 sd of this item's past silences that ended on their own, clamped to
+  [10 min, 60 min].
+- **Escalation** with jittered waits U(1,2) x threshold x 2^level: log, then kill Claude's child process trees
+  (stuck tool or background task, e.g. a preview server Claude waits on), then end Claude (the attempt loop resumes
+  the session), then report hung. Any progress resets it. If more than half of the items are suspicious at once, or
+  the model server's /health fails, escalation freezes (server problem, not the items').
+- Runs in **shadow** mode first (`watchdog_mode`: log to `traces/log/<id>.watchdog.jsonl`, no action; items are
+  stopped only after `hang_minutes` = 240 without progress). Thresholds get set from that log before `act` mode.
