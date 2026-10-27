@@ -187,6 +187,11 @@ def run_item(item: dict, cfg: dict, model_cfg: dict, model_out: Path) -> dict:
     started = time.time()
     record = {"id": iid, **{k: v for k, v in item.items() if k != "id"}, "started_at": rb.utc_stamp(started)}
     record["continued"] = continue_session
+    if _stop.is_set():
+        # Submitted just before a stop signal: don't start a container stop_containers() has already missed.
+        # Nothing is logged, so the item is picked up again (and continued in place) on the next start.
+        log.info(f"[{iid}] not started: batch is stopping")
+        return record
     log.info(f"[{iid}] {'continue' if continue_session else 'start'} ({item.get('title', '')[:40]})")
     proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
     stopped_by = "exited"
@@ -324,10 +329,18 @@ def main() -> int:
         pending = {}
         queue = iter(items)
         for item in queue:
+            # A stop signal can arrive while the first `concurrent` items are still being launched (2 s apart, so
+            # minutes at high concurrency). stop_containers() only stops what exists at that moment, so keep
+            # launching here and the new containers run on unstopped (2026-10-27: a 64-item batch, paused 18 s
+            # into its launch, kept 51 containers running for 20 min).
+            if _stop.is_set():
+                break
             pending[pool.submit(run_item, item, cfg, model_cfg, model_out)] = item["id"]
             if len(pending) >= cfg.get("concurrent", 4):
                 break
             time.sleep(cfg.get("launch_interval_s", 3))
+        if _stop.is_set():
+            stop_containers()          # also what was launched between the signal and the check above
         while pending:
             finished, _ = wait(pending, return_when=FIRST_COMPLETED)
             for fut in finished:
