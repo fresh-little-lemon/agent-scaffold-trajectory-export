@@ -18,12 +18,16 @@
   "effort": "high",
   "claude_env": {
     "ENABLE_TOOL_SEARCH": "false",
-    "CLAUDE_STREAM_IDLE_TIMEOUT_MS": "1800000",
-    "API_TIMEOUT_MS": "3600000"
+    "API_TIMEOUT_MS": "7200000",
+    "API_FORCE_IDLE_TIMEOUT": "0",
+    "CLAUDE_ENABLE_STREAM_WATCHDOG": "0",
+    "CLAUDE_ENABLE_BYTE_WATCHDOG": "0"
   },
   "max_resumes": 5,
   "hang_minutes": 240,
   "watchdog_mode": "shadow",
   "watchdog_floor_s": 600,
-  "watchdog_cap_s": 3600
+  "watchdog_cap_s": 3600,
+  "resume_unfinished": true,
+  "watchdog_model_floor_s": 7200
 }

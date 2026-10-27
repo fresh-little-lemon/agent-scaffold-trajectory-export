@@ -6,7 +6,7 @@ appends one record to OUTCOMES and prints the decision word on stdout:
   success       all deliverables present (how much to refine beyond that is the agent's call)
   fail_fatal    an error Claude Code itself cannot get past (auth, 4xx request errors, goal cleared after an
                 unrecoverable error)
-  fail_stalled  this attempt and the one before made (almost) no tool calls: /goal is not moving
+  fail_stalled  this attempt and the one before ended without an error and made (almost) no tool calls
   resume        anything else, e.g. the turn ended early or a transient API error: continue the same session
 
     attempt_outcome.py STREAM START RESULTS_DIR OUTCOMES ATTEMPT EXIT_CODE
@@ -44,7 +44,10 @@ def main() -> int:
     elif (result.get("is_error") and status in FATAL_HTTP) or "authentication" in text.lower() \
             or "unrecoverable error" in text.lower():
         decision = "fail_fatal"
-    elif tool_calls < MIN_TOOL_CALLS and previous and previous[-1].get("tool_calls", 99) < MIN_TOOL_CALLS:
+    elif (tool_calls < MIN_TOOL_CALLS and not result.get("is_error") and previous
+          and previous[-1].get("tool_calls", 99) < MIN_TOOL_CALLS and not previous[-1].get("is_error")):
+        # Stalled = attempts end cleanly without doing anything. Repeated API errors are not a stall: they are
+        # resumed with backoff until max_resumes (then gave_up).
         decision = "fail_stalled"
     else:
         decision = "resume"

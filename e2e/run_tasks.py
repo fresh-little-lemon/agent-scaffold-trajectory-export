@@ -71,7 +71,7 @@ def render_goal(template: str, item: dict, model: str, timeout_s: int = 5400) ->
 
 
 def container_command(item: dict, model: str, upstream: str, skill: str, extra_flags: str = "",
-                      max_resumes: int = 5) -> str:
+                      max_resumes: int = 5, continue_session: bool = False) -> str:
     """Prepare the input, then run Claude in an attempt loop.
 
     Attempt 1 starts the session with the /goal; later attempts resume the same session (`--continue`) and set
@@ -91,8 +91,8 @@ def container_command(item: dict, model: str, upstream: str, skill: str, extra_f
         + rb.build_proxy_start(SCAFFOLD, model, iid, upstream)
         + f"mkdir -p /home/node/.claude/skills /home/node/project/input {out}/results/{iid} && "
         f"rm -rf /home/node/.claude/skills/{skill} && cp -r /opt/skills/{skill} /home/node/.claude/skills/ && "
-        f"{clip} && cd /home/node/project && "
-        f"attempt=0; delay=60; decision=resume; "
+        f"{{ [ -s /home/node/project/input/{iid}.mp4 ] || {clip}; }} && cd /home/node/project && "
+        f"attempt={1 if continue_session else 0}; delay=60; decision=resume; "
         f"while [ \"$decision\" = resume ] && [ $attempt -le {max_resumes} ]; do "
         f"attempt=$((attempt+1)); start=$(stat -c %s {stream} 2>/dev/null || echo 0); "
         f"if [ $attempt -eq 1 ]; then {claude} -p \"$(cat {out}/goal.txt)\" >> {stream} 2>&1; "
@@ -137,7 +137,12 @@ def run_item(item: dict, cfg: dict, model_cfg: dict, model_out: Path) -> dict:
     model = model_cfg["model_name"]
     run_home = model_out / "workspace" / iid
     item_root = model_out / "items" / iid
-    rb.move_to_attempts(model_out, iid, run_home, item_root, reason="rerun")
+    # An unfinished earlier run of this item (batch restarted) is continued in place: same workspace, same Claude
+    # session (`--continue`), traces appended (a new proxy run id keeps its sidecars apart).
+    sessions = list((run_home / ".claude" / "projects").glob("*/*.jsonl")) if run_home.is_dir() else []
+    continue_session = bool(cfg.get("resume_unfinished", True) and sessions)
+    if not continue_session:
+        rb.move_to_attempts(model_out, iid, run_home, item_root, reason="rerun")
     for sub in (run_home / ".claude", item_root / "traces" / "log", item_root / "results" / iid):
         sub.mkdir(parents=True, exist_ok=True)
     for p in (run_home, item_root, item_root / "traces", item_root / "traces" / "log",
@@ -178,10 +183,11 @@ def run_item(item: dict, cfg: dict, model_cfg: dict, model_out: Path) -> dict:
            *(["-v", f"{(REPO / cfg['stop_hook']).parent}:/opt/hooks:ro"] if cfg.get("stop_hook") else []),
            IMAGE, "bash", "-c", container_command(item, model, upstream, cfg.get("skill", "media2threejs"),
                                                   f"--effort {cfg['effort']} " if cfg.get("effort") else "",
-                                                  cfg.get("max_resumes", 5))]
+                                                  cfg.get("max_resumes", 5), continue_session)]
     started = time.time()
     record = {"id": iid, **{k: v for k, v in item.items() if k != "id"}, "started_at": rb.utc_stamp(started)}
-    log.info(f"[{iid}] start ({item.get('title', '')[:40]})")
+    record["continued"] = continue_session
+    log.info(f"[{iid}] {'continue' if continue_session else 'start'} ({item.get('title', '')[:40]})")
     proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
     stopped_by = "exited"
     # No fixed working-time limit: a heartbeat watchdog (e2e/watchdog.py) follows what the agent is doing and
@@ -189,7 +195,7 @@ def run_item(item: dict, cfg: dict, model_cfg: dict, model_out: Path) -> dict:
     # `hang_minutes` without any progress, or at the `container_timeout` safety limit.
     wd = ItemWatchdog(iid, f"rt_{os.getpid()}_{iid}"[:63], item_root, run_home / "project", REGISTRY,
                       mode=cfg.get("watchdog_mode", "shadow"), floor_s=cfg.get("watchdog_floor_s", 600),
-                      cap_s=cfg.get("watchdog_cap_s", 3600))
+                      cap_s=cfg.get("watchdog_cap_s", 3600), model_floor_s=cfg.get("watchdog_model_floor_s", 7200))
     hang_s = cfg.get("hang_minutes", 240) * 60
     interval = 30
     try:

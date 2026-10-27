@@ -79,7 +79,7 @@ class Registry:
 class ItemWatchdog:
     def __init__(self, iid: str, container: str, item_root: Path, project_dir: Path, registry: Registry,
                  mode: str = "shadow", floor_s: float = 600, cap_s: float = 3600, max_level: int = 3,
-                 cpu_busy_cores: float = 0.2):
+                 cpu_busy_cores: float = 0.2, model_floor_s: float = 7200):
         self.iid, self.container, self.mode = iid, container, mode
         self.item_root, self.project_dir, self.registry = item_root, project_dir, registry
         self.stream = item_root / "traces" / "log" / f"{iid}.claude.stream.jsonl"
@@ -87,6 +87,9 @@ class ItemWatchdog:
         self.wire = item_root / "traces" / f"{iid}.jsonl.wire"
         self.events_path = item_root / "traces" / "log" / f"{iid}.watchdog.jsonl"
         self.floor_s, self.cap_s, self.max_level, self.cpu_busy = floor_s, cap_s, max_level, cpu_busy_cores
+        # A model call can stream nothing for a long time: vLLM's DeepSeek tool parser sends a long tool argument
+        # (a whole file) only once it is complete. Silence while a call is in flight gets this floor.
+        self.model_floor_s = model_floor_s
         self.stream_pos = 0
         self.pending_tools: dict[str, dict] = {}
         self.tasks: dict[str, dict] = {}
@@ -161,18 +164,27 @@ class ItemWatchdog:
         return size, wire
 
     def _in_flight(self) -> int:
-        starts = finished = 0
+        """Model calls started by the current proxy process and not finished yet. Earlier proxy runs (a batch
+        restart continued this item) can leave calls that never finish; they belong to a dead process."""
+        run, starts = None, set()
         try:
             for line in self.journal.open(encoding="utf-8", errors="replace"):
-                starts += '"exchange_start"' in line
-        except OSError:
+                if '"proxy_start"' in line:
+                    run, starts = json.loads(line).get("proxy_run_id"), set()
+                elif '"exchange_start"' in line and run is not None:
+                    e = json.loads(line)
+                    if e.get("proxy_run_id") == run:
+                        starts.add(e.get("n"))
+        except (OSError, json.JSONDecodeError):
             return 0
-        trace = self.item_root / "traces" / f"{self.iid}.jsonl"
+        finished = set()
         try:
-            finished = sum(1 for _ in trace.open(encoding="utf-8", errors="replace"))
-        except OSError:
+            for line in (self.item_root / "traces" / f"{self.iid}.jsonl").open(encoding="utf-8", errors="replace"):
+                if run and run in line:
+                    finished.add(json.loads(line).get("n"))
+        except (OSError, json.JSONDecodeError):
             pass
-        return max(0, starts - finished)
+        return len(starts - finished)
 
     def _project_mtime(self) -> float:
         """Newest directory mtime under the project: creating or removing a file updates its directory, so this
@@ -219,10 +231,11 @@ class ItemWatchdog:
 
     # ---- decision -----------------------------------------------------------------------------------------
     def _threshold(self, state: str) -> float:
+        floor = self.model_floor_s if state == "model" else self.floor_s
         h = self.history.get(state, [])
         if len(h) < 3:
-            return self.floor_s
-        return min(self.cap_s, max(self.floor_s, statistics.mean(h) + 4 * statistics.pstdev(h)))
+            return floor
+        return min(max(self.cap_s, floor), max(floor, statistics.mean(h) + 4 * statistics.pstdev(h)))
 
     def _log(self, kind: str, **fields) -> None:
         rec = {"at": round(time.time(), 1), "event": kind, "mode": self.mode, **fields}

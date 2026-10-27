@@ -48,11 +48,11 @@ def test_partial_last_line_is_kept_for_next_poll(tmp_path):
 
 def test_threshold_adapts_to_this_items_silences(tmp_path):
     wd, _ = make(tmp_path)
-    assert wd._threshold("model") == 600                       # floor until there is history
-    wd.history["model"] = [900, 1000, 1100]
-    assert 1000 < wd._threshold("model") <= 3600               # mean + 4 sd, capped
-    wd.history["model"] = [5000, 9000, 20000]
-    assert wd._threshold("model") == 3600
+    assert wd._threshold("tool") == 600                        # floor until there is history
+    wd.history["tool"] = [900, 1000, 1100]
+    assert 1000 < wd._threshold("tool") <= 3600                # mean + 4 sd, capped
+    wd.history["tool"] = [5000, 9000, 20000]
+    assert wd._threshold("tool") == 3600
 
 
 def test_shadow_mode_never_reports_hung(tmp_path, monkeypatch):
@@ -77,3 +77,20 @@ def test_global_stall_freezes_escalation(tmp_path):
     reg.set("i1", False)
     reg.set("i2", False)
     assert reg.global_stall() is False
+
+
+def test_in_flight_counts_only_the_current_proxy_run(tmp_path):
+    wd, _ = make(tmp_path)
+    journal = wd.journal
+    lines = [{"event": "proxy_start", "proxy_run_id": "old"}, {"event": "exchange_start", "proxy_run_id": "old", "n": 1},
+             {"event": "proxy_start", "proxy_run_id": "new"}, {"event": "exchange_start", "proxy_run_id": "new", "n": 1},
+             {"event": "exchange_start", "proxy_run_id": "new", "n": 2}]
+    journal.write_text("".join(json.dumps(l) + "\n" for l in lines))
+    (wd.item_root / "traces" / "X.jsonl").write_text(json.dumps({"proxy_run_id": "new", "n": 1}) + "\n")
+    assert wd._in_flight() == 1               # old run's unfinished call is ignored; new n=2 is in flight
+
+
+def test_model_state_gets_its_own_floor(tmp_path):
+    wd, _ = make(tmp_path)
+    assert wd._threshold("model") == wd.model_floor_s == 7200
+    assert wd._threshold("tool") == 600

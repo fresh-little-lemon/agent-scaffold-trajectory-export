@@ -46,3 +46,8 @@ def test_transient_error_resumes(tmp_path):
 def test_two_idle_attempts_are_stalled(tmp_path):
     assert run(tmp_path, tool_turns(1)) == "resume"
     assert run(tmp_path, tool_turns(1), prior=[{"tool_calls": 0}]) == "fail_stalled"
+
+
+def test_repeated_api_errors_are_not_a_stall(tmp_path):
+    events = [{"type": "result", "is_error": True, "api_error_status": None, "result": "API Error: The operation timed out."}]
+    assert run(tmp_path, events, prior=[{"tool_calls": 0, "is_error": True}]) == "resume"
