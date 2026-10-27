@@ -58,17 +58,17 @@ item had 4-6 compaction calls, which only the trace has.
 
 ## Run 2026-10-26/27 (106 items, 32 concurrent, 90 min limit per attempt)
 
-Numbers from `dataset/stats.json` at 23:05 UTC (the last 17 items finish by about 00:05 UTC; `e2e/tasks/finish_run.sh`
-then stops the runner before its retry rounds and runs the final post-processing).
+Final numbers from `dataset/stats.json` after `e2e/tasks/finish_run.sh` stopped the runner at 00:10 UTC (before its
+retry rounds) and ran the final post-processing.
 
 | | value |
 |---|---|
-| items with a white-model video | 64 of 105 recorded (61 of the 106 scale items) |
-| wall time per successful item | 87.8 min (agents keep refining until the stop time stated in the goal) |
-| model time per successful item | 82.1 min (sum of `/v1/messages` durations) |
-| model calls per successful item | 63 |
-| input tokens per successful item | 3.57 M (each call's full prompt summed; vLLM prefix-cache hit rate about 90%) |
-| output tokens per successful item | 64 k |
+| items with a white-model video | 79 of 116 (34 timeouts, 3 exited without a video) |
+| wall time per successful item | 85.7 min (agents keep refining until the stop time stated in the goal) |
+| model time per successful item | 80.1 min (sum of `/v1/messages` durations) |
+| model calls per successful item | 63 (93 training rows in total) |
+| input tokens per successful item | 3.73 M (each call's full prompt summed; vLLM prefix-cache hit rate about 90%) |
+| output tokens per successful item | 66 k |
 | transcript vs trace | every rebuilt call matched its wire request exactly (messages, system, tools, params) |
 | vLLM throughput at 32 agents | 30-37 running requests, 450-1100 generated tokens/s, KV cache 5-21% |
 | storage | about 150 MB per item (mostly the agents' rendered frame PNGs), 21 GB for the run |
