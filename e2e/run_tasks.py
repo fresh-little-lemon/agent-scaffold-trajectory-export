@@ -324,6 +324,12 @@ def main() -> int:
         done = {json.loads(l)["id"] for l in (model_out / "batch_log.jsonl").read_text().splitlines()
                 if l.strip() and json.loads(l).get("status") == "success"}
     items = [i for i in items if i["id"] not in done]
+    # Unfinished items first, most progress (largest Claude session) first: they are the closest to delivery, and a
+    # fresh item started ahead of them only delays every completion.
+    def progress(item):
+        return sum(f.stat().st_size for f in (model_out / "workspace" / item["id"] / ".claude" / "projects").glob("*/*.jsonl"))
+    if cfg.get("resume_unfinished", True):
+        items.sort(key=progress, reverse=True)
     if not wait_upstream(model_cfg["anthropic_base_url"]):
         log.error(f"model server {model_cfg['anthropic_base_url']} not reachable")
         return 2
