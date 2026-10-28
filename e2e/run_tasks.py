@@ -18,6 +18,7 @@ copied into batch_log.jsonl so each output maps back to its source video.
 from __future__ import annotations
 
 import argparse
+import collections
 import json
 import os
 import shlex
@@ -41,6 +42,8 @@ SCAFFOLD = "claude_code"
 LABEL = f"run_tasks_pid={os.getpid()}"
 _stop = threading.Event()
 _lock = threading.Lock()
+# Items being stopped to bring the batch down to a lower concurrency target; they are requeued at the front.
+_scaled_down: set[str] = set()
 
 
 def stop_containers(extra: str = "") -> None:
@@ -238,6 +241,8 @@ def run_item(item: dict, cfg: dict, model_cfg: dict, model_out: Path) -> dict:
         err = "docker client did not exit after stop"
     if _stop.is_set() and stopped_by == "exited":
         stopped_by = "batch_stop"
+    if iid in _scaled_down and stopped_by == "exited":
+        stopped_by = "scaled_down"     # stopped to lower concurrency; requeued, continues in place later
     elapsed = time.time() - started
     results = item_root / "results" / iid
     exit_file = item_root / "traces" / "log" / f"{iid}.exit"
@@ -255,7 +260,7 @@ def run_item(item: dict, cfg: dict, model_cfg: dict, model_out: Path) -> dict:
     decision = (record["claude_exit"] or "").strip()
     if record["whitebox_s"] and decision == "success":
         record["status"] = "success"
-    elif stopped_by in ("hung", "timeout", "batch_stop"):
+    elif stopped_by in ("hung", "timeout", "batch_stop", "scaled_down"):
         record["status"] = stopped_by
     elif decision in ("fail_fatal", "fail_stalled", "gave_up"):
         record["status"] = decision
@@ -340,43 +345,60 @@ def main() -> int:
     log.info(f"{len(items)} items, concurrent={cfg.get('concurrent', 4)}, image={IMAGE}, out={model_out}")
     # The pool is sized for the largest concurrency the batch may be raised to; idle threads cost nothing.
     with ThreadPoolExecutor(cfg.get("max_concurrent", max(256, cfg.get("concurrent", 4)))) as pool:
-        pending = {}
-        queue = iter(items)
-        exhausted, stopped_cleanup, shown = False, False, None
+        pending = {}                     # future -> item id
+        by_id = {i["id"]: i for i in items}
+        launched = []                    # running item ids, oldest first
+        queue = collections.deque(items)
+        stopped_cleanup, shown = False, None
         while True:
             target = target_concurrency(cfg)
             if target != shown:
                 log.info(f"concurrency target {target} (running {len(pending)})")
                 shown = target
-            # Top up to the target. A lower target is reached by not refilling: running items are never cut.
-            # A stop signal can arrive while items are still being launched (launch_interval_s apart, so minutes
-            # at high concurrency); stop_containers() only stops what exists at that moment, so check it per item
-            # (2026-10-27: a 64-item batch paused 18 s into its launch kept 51 containers running for 20 min).
-            while len(pending) < target and not exhausted and not _stop.is_set():
-                nxt = next(queue, None)
-                if nxt is None:
-                    exhausted = True
-                    break
+            # Down: stop the most recently launched items over the target (least progress, cheapest context to
+            # rebuild) and requeue them at the front; they continue in place (same workspace and Claude session)
+            # when a slot frees. Only stopping new launches would leave the load in place for hours.
+            active = [i for i in launched if i not in _scaled_down]
+            if not _stop.is_set() and len(active) > target:
+                for iid in active[target:]:
+                    with _lock:
+                        _scaled_down.add(iid)
+                    threading.Thread(target=stop_containers, args=(f"--filter label=rb_item={iid}",),
+                                     daemon=True).start()
+                log.info(f"scaling down to {target}: stopping {len(active) - target} item(s)")
+            # Up: top up to the target. A stop signal can arrive while items are still being launched
+            # (launch_interval_s apart, so minutes at high concurrency); stop_containers() only stops what exists
+            # at that moment, so check it per item (2026-10-27: a 64-item batch paused 18 s into its launch kept
+            # 51 containers running for 20 min).
+            while len(pending) < target and queue and not _stop.is_set():
+                nxt = queue.popleft()
                 pending[pool.submit(run_item, nxt, cfg, model_cfg, model_out)] = nxt["id"]
+                launched.append(nxt["id"])
                 time.sleep(cfg.get("launch_interval_s", 3))
             if _stop.is_set() and not stopped_cleanup:
                 stop_containers()      # also what was launched between the signal and the check above
                 stopped_cleanup = True
             if not pending:
-                if exhausted or _stop.is_set():
+                if not queue or _stop.is_set():
                     break
                 time.sleep(10)         # target is 0: idle until it is raised
                 continue
-            # Wake up every 30 s even without a finished item, so a raised target is acted on promptly.
+            # Wake up every 30 s even without a finished item, so a changed target is acted on promptly.
             finished, _ = wait(pending, timeout=30, return_when=FIRST_COMPLETED)
             for fut in finished:
                 iid = pending.pop(fut)
+                launched.remove(iid)
                 try:
                     fut.result()
                 except Exception as exc:  # keep the batch going; the item is logged as an error
                     log.exception(f"[{iid}] runner error")
                     with _lock, (model_out / "batch_log.jsonl").open("a", encoding="utf-8") as f:
                         f.write(json.dumps({"id": iid, "status": "runner_error", "error": repr(exc)}) + "\n")
+                with _lock:
+                    requeue = iid in _scaled_down
+                    _scaled_down.discard(iid)
+                if requeue and not _stop.is_set():
+                    queue.appendleft(by_id[iid])
     log.info("batch complete")
     return 0
 
