@@ -52,6 +52,19 @@ def stop_containers(extra: str = "") -> None:
         log.warning(f"docker stop did not return ({extra}); container may be stuck in the daemon")
 
 
+def target_concurrency(cfg: dict) -> int:
+    """Items to keep running. With `concurrency_file` in the config, its first number is read on every scheduling
+    pass, so the batch can be scaled up or down while it runs (no restart, no re-prefill of every agent's context);
+    a missing or unreadable file falls back to `concurrent`."""
+    path = cfg.get("concurrency_file")
+    if path:
+        try:
+            return max(0, int(Path(path).read_text().split()[0]))
+        except (OSError, ValueError, IndexError):
+            pass
+    return cfg.get("concurrent", 4)
+
+
 def on_signal(signum, _frame):
     log.warning(f"signal {signum}: stop dispatching, stopping containers")
     _stop.set()
@@ -325,24 +338,37 @@ def main() -> int:
     (model_out / "manifests" / f"{rb.utc_stamp()}.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     log.info(f"{len(items)} items, concurrent={cfg.get('concurrent', 4)}, image={IMAGE}, out={model_out}")
-    with ThreadPoolExecutor(cfg.get("concurrent", 4)) as pool:
+    # The pool is sized for the largest concurrency the batch may be raised to; idle threads cost nothing.
+    with ThreadPoolExecutor(cfg.get("max_concurrent", max(256, cfg.get("concurrent", 4)))) as pool:
         pending = {}
         queue = iter(items)
-        for item in queue:
-            # A stop signal can arrive while the first `concurrent` items are still being launched (2 s apart, so
-            # minutes at high concurrency). stop_containers() only stops what exists at that moment, so keep
-            # launching here and the new containers run on unstopped (2026-10-27: a 64-item batch, paused 18 s
-            # into its launch, kept 51 containers running for 20 min).
-            if _stop.is_set():
-                break
-            pending[pool.submit(run_item, item, cfg, model_cfg, model_out)] = item["id"]
-            if len(pending) >= cfg.get("concurrent", 4):
-                break
-            time.sleep(cfg.get("launch_interval_s", 3))
-        if _stop.is_set():
-            stop_containers()          # also what was launched between the signal and the check above
-        while pending:
-            finished, _ = wait(pending, return_when=FIRST_COMPLETED)
+        exhausted, stopped_cleanup, shown = False, False, None
+        while True:
+            target = target_concurrency(cfg)
+            if target != shown:
+                log.info(f"concurrency target {target} (running {len(pending)})")
+                shown = target
+            # Top up to the target. A lower target is reached by not refilling: running items are never cut.
+            # A stop signal can arrive while items are still being launched (launch_interval_s apart, so minutes
+            # at high concurrency); stop_containers() only stops what exists at that moment, so check it per item
+            # (2026-10-27: a 64-item batch paused 18 s into its launch kept 51 containers running for 20 min).
+            while len(pending) < target and not exhausted and not _stop.is_set():
+                nxt = next(queue, None)
+                if nxt is None:
+                    exhausted = True
+                    break
+                pending[pool.submit(run_item, nxt, cfg, model_cfg, model_out)] = nxt["id"]
+                time.sleep(cfg.get("launch_interval_s", 3))
+            if _stop.is_set() and not stopped_cleanup:
+                stop_containers()      # also what was launched between the signal and the check above
+                stopped_cleanup = True
+            if not pending:
+                if exhausted or _stop.is_set():
+                    break
+                time.sleep(10)         # target is 0: idle until it is raised
+                continue
+            # Wake up every 30 s even without a finished item, so a raised target is acted on promptly.
+            finished, _ = wait(pending, timeout=30, return_when=FIRST_COMPLETED)
             for fut in finished:
                 iid = pending.pop(fut)
                 try:
@@ -351,10 +377,6 @@ def main() -> int:
                     log.exception(f"[{iid}] runner error")
                     with _lock, (model_out / "batch_log.jsonl").open("a", encoding="utf-8") as f:
                         f.write(json.dumps({"id": iid, "status": "runner_error", "error": repr(exc)}) + "\n")
-                if not _stop.is_set():
-                    nxt = next(queue, None)
-                    if nxt is not None:
-                        pending[pool.submit(run_item, nxt, cfg, model_cfg, model_out)] = nxt["id"]
     log.info("batch complete")
     return 0
 

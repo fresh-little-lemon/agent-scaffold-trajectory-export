@@ -5,9 +5,9 @@
   "items": "/home/tsq/workspace/agent-scaffold-trajectory-export/e2e/tasks/chem_videos.jsonl",
   "goal_template": "e2e/tasks/media2threejs_goal.txt",
   "output_base": "/home/tsq/workspace/agent-scaffold-trajectory-export/e2e/3d-code-gen",
-  "concurrent": 32,
+  "concurrent": 128,
   "container_timeout": 86400,
-  "cpus_per_item": 6,
+  "cpus_per_item": 12,
   "drop_node_modules": true,
   "archive_attempts": false,
   "npm_cache_dir": "/home/tsq/workspace/agent-scaffold-trajectory-export/e2e/3d-code-gen/.npm-cache",
@@ -29,5 +29,6 @@
   "watchdog_floor_s": 600,
   "watchdog_cap_s": 3600,
   "resume_unfinished": true,
-  "watchdog_model_floor_s": 7200
+  "watchdog_model_floor_s": 7200,
+  "concurrency_file": "/home/tsq/workspace/agent-scaffold-trajectory-export/e2e/3d-code-gen/CONCURRENCY"
 }
