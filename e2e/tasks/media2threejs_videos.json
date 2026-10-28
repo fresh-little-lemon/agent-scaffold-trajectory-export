@@ -11,7 +11,7 @@
   "drop_node_modules": true,
   "archive_attempts": false,
   "npm_cache_dir": "/home/tsq/workspace/agent-scaffold-trajectory-export/e2e/3d-code-gen/.npm-cache",
-  "launch_interval_s": 2,
+  "launch_interval_s": 1,
   "stop_hook": "e2e/tasks/hooks/require_deliverables.py",
   "auto_compact_window": 200000,
   "autocompact_pct": 80,
