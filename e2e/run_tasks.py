@@ -184,6 +184,9 @@ def run_item(item: dict, cfg: dict, model_cfg: dict, model_out: Path) -> dict:
     env["M2T_RESULTS_DIR"] = f"/app/outputs/{SCAFFOLD}/{model}/results/{iid}"
     env.update(rb.build_claude_code_env(model, model_cfg.get("api_key", "EMPTY"),
                                         f"http://127.0.0.1:{rb.IN_CONTAINER_PROXY_PORT}", cfg.get("claude_env")))
+    if cfg.get("deliverable_mode") == "core_whitebox":
+        env["M2T_DELIVERABLE_MODE"] = "core_whitebox"
+        env["M2T_SCENE_DIR"] = "/home/node/project/scene"
     cmd = ["docker", "run", "--rm", "--init", "--name", f"rt_{os.getpid()}_{iid}"[:63],
            "--label", LABEL, "--label", f"rb_item={iid}",
            "--add-host", "host.docker.internal:host-gateway", "--user", f"{os.getuid()}:{os.getgid()}",

@@ -1,0 +1,5 @@
+Read the media2threejs skill at /home/node/.claude/skills/media2threejs/SKILL.md and follow its video-scene route and state graph. Reconstruct the reference clip {clip}, which is {clip_seconds:.0f} seconds long ("{title}"), as an editable Three.js scene in /home/node/project/scene. Cover the complete reference, including its shots, transitions, framing, layout and principal motion.
+
+Complete the applicable skill workflow: create the required scene and state/review evidence, build or load the scene, and check it in the headless browser using the route specified by the skill. Render the completed scene through the skill's headless rendering workflow and write the resulting video to {results}/whitebox.mp4. Check the rendered result against the reference duration and aspect ratio and inspect the rendered output. Apply a correction and render again when the skill review or the observed result calls for it.
+
+Leave the editable scene, render scripts, observations, state/review evidence and final whitebox.mp4 in the workspace. Finish when the applicable skill handoff is complete and the core scene and video artifacts are available.

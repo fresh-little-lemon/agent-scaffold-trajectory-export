@@ -12,10 +12,12 @@ appends one record to OUTCOMES and prints the decision word on stdout:
     attempt_outcome.py STREAM START RESULTS_DIR OUTCOMES ATTEMPT EXIT_CODE
 """
 import json
+import os
 import sys
 from pathlib import Path
 
-REQUIRED = {"whitebox.mp4": 10_000, "compare.mp4": 10_000, "compare.jpg": 1_000, "README.md": 50}
+FULL_REQUIRED = {"whitebox.mp4": 10_000, "compare.mp4": 10_000, "compare.jpg": 1_000, "README.md": 50}
+CORE_REQUIRED = {"whitebox.mp4": 10_000}
 FATAL_HTTP = {400, 401, 403, 404, 413}
 MIN_TOOL_CALLS = 3
 
@@ -36,7 +38,12 @@ def main() -> int:
     text = str(result.get("result") or "")
     status = result.get("api_error_status")
     results = Path(results)
-    deliverables = all((results / n).is_file() and (results / n).stat().st_size >= s for n, s in REQUIRED.items())
+    required = CORE_REQUIRED if os.environ.get("M2T_DELIVERABLE_MODE") == "core_whitebox" else FULL_REQUIRED
+    deliverables = all((results / n).is_file() and (results / n).stat().st_size >= s for n, s in required.items())
+    if deliverables and os.environ.get("M2T_DELIVERABLE_MODE") == "core_whitebox":
+        scene = Path(os.environ.get("M2T_SCENE_DIR", "/home/node/project/scene"))
+        deliverables = any(path.is_file() for pattern in ("*.ts", "*.js", "*.mjs")
+                           for path in scene.glob(pattern))
     previous = [json.loads(l) for l in Path(outcomes).read_text().splitlines()] if Path(outcomes).is_file() else []
 
     if deliverables:
