@@ -12,8 +12,8 @@
   "drop_node_modules": true,
   "archive_attempts": false,
   "stop_hook": "e2e/tasks/hooks/require_core_deliverables.py",
-  "auto_compact_window": 200000,
-  "autocompact_pct": 80,
+  "effort": "ultracode",
+  "auto_compact_window": 262144,
   "claude_env": {
     "ENABLE_TOOL_SEARCH": "false"
   }

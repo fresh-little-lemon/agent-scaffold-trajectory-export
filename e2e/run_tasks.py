@@ -111,9 +111,9 @@ def container_command(item: dict, model: str, upstream: str, skill: str, extra_f
         f"attempt={1 if continue_session else 0}; delay=60; decision=resume; "
         f"while [ \"$decision\" = resume ] && [ $attempt -le {max_resumes} ]; do "
         f"attempt=$((attempt+1)); start=$(stat -c %s {stream} 2>/dev/null || echo 0); "
-        f"if [ $attempt -eq 1 ]; then {claude} -p \"$(cat {out}/goal.txt)\" >> {stream} 2>&1; "
+        f"if [ $attempt -eq 1 ]; then {claude} -p \"/goal $(cat {out}/goal.txt)\" >> {stream} 2>&1; "
         f"else sleep $delay; delay=$((delay*2 > 900 ? 900 : delay*2)); "
-        f"{claude} --continue -p \"$(cat {out}/goal.txt)\" >> {stream} 2>&1; fi; rc=$?; "
+        f"{claude} --continue -p \"/goal $(cat {out}/goal.txt)\" >> {stream} 2>&1; fi; rc=$?; "
         f"decision=$(python3 /opt/hooks/attempt_outcome.py {stream} $start {out}/results/{iid} "
         f"{log_dir}/{iid}.outcomes.jsonl $attempt $rc); "
         f"done; [ \"$decision\" = resume ] && decision=gave_up; "
@@ -180,7 +180,8 @@ def run_item(item: dict, cfg: dict, model_cfg: dict, model_out: Path) -> dict:
     window = cfg.get("auto_compact_window") or model_cfg.get("context_window")
     if window:
         env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(window)
-        env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] = str(cfg.get("autocompact_pct", 60))
+    if cfg.get("autocompact_pct") is not None:
+        env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] = str(cfg["autocompact_pct"])
     env["M2T_RESULTS_DIR"] = f"/app/outputs/{SCAFFOLD}/{model}/results/{iid}"
     env.update(rb.build_claude_code_env(model, model_cfg.get("api_key", "EMPTY"),
                                         f"http://127.0.0.1:{rb.IN_CONTAINER_PROXY_PORT}", cfg.get("claude_env")))
