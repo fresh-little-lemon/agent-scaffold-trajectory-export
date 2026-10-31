@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import hashlib
 import json
 import os
 import shlex
@@ -41,6 +42,10 @@ REPO = Path(__file__).resolve().parent.parent
 SCAFFOLD = "claude_code"
 LABEL = f"run_tasks_pid={os.getpid()}"
 _stop = threading.Event()
+# detach_on_signal: containers run `docker run -d` under a label/name that is stable across runner restarts, so a
+# restarted runner can re-adopt them (find_containers); SIGTERM/SIGUSR1 then leaves them running.
+DETACH = False
+BATCH = ""
 _lock = threading.Lock()
 # Items being stopped to bring the batch down to a lower concurrency target; they are requeued at the front.
 _scaled_down: set[str] = set()
@@ -53,6 +58,22 @@ def stop_containers(extra: str = "") -> None:
                        shell=True, capture_output=True, text=True, timeout=rb.DOCKER_STOP_TIMEOUT + 120)
     except subprocess.TimeoutExpired:
         log.warning(f"docker stop did not return ({extra}); container may be stuck in the daemon")
+
+
+def container_name(iid: str) -> str:
+    return (f"rt_{BATCH}_{iid}" if DETACH else f"rt_{os.getpid()}_{iid}")[:63]
+
+
+def find_containers() -> dict[str, tuple[str, str]]:
+    """Containers of this batch left by an earlier runner: item id -> (name, state), running or exited."""
+    r = subprocess.run(["docker", "ps", "-a", "--filter", f"label={LABEL}", "--format",
+                        '{{.Label "rb_item"}} {{.Names}} {{.State}}'], capture_output=True, text=True, timeout=120)
+    found = {}
+    for line in r.stdout.splitlines():
+        iid, name, state = (line.split() + ["", "", ""])[:3]
+        if iid and name and state in ("running", "exited"):
+            found[iid] = (name, state)
+    return found
 
 
 def target_concurrency(cfg: dict) -> int:
@@ -69,8 +90,10 @@ def target_concurrency(cfg: dict) -> int:
 
 
 def on_signal(signum, _frame):
-    log.warning(f"signal {signum}: stop dispatching, stopping containers")
+    log.warning(f"signal {signum}: stop dispatching, {'leaving containers running' if DETACH else 'stopping containers'}")
     _stop.set()
+    if DETACH:
+        return
     threading.Thread(target=stop_containers, daemon=True).start()
 
 
@@ -148,7 +171,8 @@ def ffprobe_duration(path: Path) -> float | None:
         return None
 
 
-def run_item(item: dict, cfg: dict, model_cfg: dict, model_out: Path) -> dict:
+def build_container(item: dict, cfg: dict, model_cfg: dict, model_out: Path) -> tuple[list, bool]:
+    """Prepare the item's directories and return the `docker run` command and whether it continues a session."""
     iid = item["id"]
     model = model_cfg["model_name"]
     run_home = model_out / "workspace" / iid
@@ -188,7 +212,8 @@ def run_item(item: dict, cfg: dict, model_cfg: dict, model_out: Path) -> dict:
     if cfg.get("deliverable_mode") == "core_whitebox":
         env["M2T_DELIVERABLE_MODE"] = "core_whitebox"
         env["M2T_SCENE_DIR"] = "/home/node/project/scene"
-    cmd = ["docker", "run", "--rm", "--init", "--name", f"rt_{os.getpid()}_{iid}"[:63],
+    # Detached containers are not --rm: their exit code and logs must outlive the runner (removed after finalizing).
+    cmd = ["docker", "run", *(["-d"] if DETACH else ["--rm"]), "--init", "--name", container_name(iid),
            "--label", LABEL, "--label", f"rb_item={iid}",
            "--add-host", "host.docker.internal:host-gateway", "--user", f"{os.getuid()}:{os.getgid()}",
            "--shm-size", "2g", "--cpus", str(cfg.get("cpus_per_item", 6)),
@@ -204,28 +229,55 @@ def run_item(item: dict, cfg: dict, model_cfg: dict, model_out: Path) -> dict:
            IMAGE, "bash", "-c", container_command(item, model, upstream, cfg.get("skill", "media2threejs"),
                                                   f"--effort {cfg['effort']} " if cfg.get("effort") else "",
                                                   cfg.get("max_resumes", 5), continue_session)]
+    return cmd, continue_session
+
+
+def run_item(item: dict, cfg: dict, model_cfg: dict, model_out: Path, adopt: str | None = None) -> dict:
+    """Run one item's container and log the result. `adopt` is the name of a container a previous runner started
+    (detach mode): it is supervised and finalized, not started again."""
+    iid = item["id"]
+    model = model_cfg["model_name"]
+    run_home = model_out / "workspace" / iid
+    item_root = model_out / "items" / iid
+    if adopt:
+        cmd, continue_session = None, True
+    else:
+        cmd, continue_session = build_container(item, cfg, model_cfg, model_out)
     started = time.time()
     record = {"id": iid, **{k: v for k, v in item.items() if k != "id"}, "started_at": rb.utc_stamp(started)}
     record["continued"] = continue_session
+    if adopt:
+        record["adopted"] = True
     if _stop.is_set():
         # Submitted just before a stop signal: don't start a container stop_containers() has already missed.
         # Nothing is logged, so the item is picked up again (and continued in place) on the next start.
         log.info(f"[{iid}] not started: batch is stopping")
         return record
-    log.info(f"[{iid}] {'continue' if continue_session else 'start'} ({item.get('title', '')[:40]})")
-    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    log.info(f"[{iid}] {'adopt ' + adopt if adopt else 'continue' if continue_session else 'start'} "
+             f"({item.get('title', '')[:40]})")
+    name, launch_err = adopt or container_name(iid), ""
+    if DETACH:
+        if not adopt:
+            launch_err = subprocess.run(cmd, capture_output=True, text=True, timeout=300).stderr
+        proc = subprocess.Popen(["docker", "wait", name], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    else:
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
     stopped_by = "exited"
     # No fixed working-time limit: a heartbeat watchdog (e2e/watchdog.py) follows what the agent is doing and
     # how long its silences usually last. In "shadow" mode it only logs; the item is then stopped only after
     # `hang_minutes` without any progress, or at the `container_timeout` safety limit.
-    wd = ItemWatchdog(iid, f"rt_{os.getpid()}_{iid}"[:63], item_root, run_home / "project", REGISTRY,
+    wd = ItemWatchdog(iid, name, item_root, run_home / "project", REGISTRY,
                       mode=cfg.get("watchdog_mode", "shadow"), floor_s=cfg.get("watchdog_floor_s", 600),
                       cap_s=cfg.get("watchdog_cap_s", 3600), model_floor_s=cfg.get("watchdog_model_floor_s", 7200))
     hang_s = cfg.get("hang_minutes", 240) * 60
     interval = 30
     try:
         while proc.poll() is None:
-            time.sleep(interval)
+            (_stop.wait if DETACH else time.sleep)(interval)
+            if DETACH and _stop.is_set():
+                proc.kill()            # only the `docker wait` client; the container keeps running
+                log.info(f"[{iid}] runner stopping, container {name} left running")
+                return record
             try:
                 verdict = wd.poll(interval)
             except Exception as exc:  # the watchdog must never take the item down
@@ -240,9 +292,15 @@ def run_item(item: dict, cfg: dict, model_cfg: dict, model_out: Path) -> dict:
     finally:
         wd.close()
     try:
-        _, err = proc.communicate(timeout=rb.DOCKER_STOP_TIMEOUT + 90)
+        out, err = proc.communicate(timeout=rb.DOCKER_STOP_TIMEOUT + 90)
+        exit_code = proc.returncode
+        if DETACH:                     # `docker wait` prints the container's exit code; its logs stand in for stderr
+            exit_code = int(out.strip()) if out.strip().lstrip("-").isdigit() else None
+            logs = subprocess.run(["docker", "logs", "--tail", "20", name], capture_output=True, text=True)
+            err = launch_err or err or logs.stdout + logs.stderr
+            subprocess.run(["docker", "rm", "-f", name], capture_output=True)
     except subprocess.TimeoutExpired:
-        err = "docker client did not exit after stop"
+        err, exit_code = "docker client did not exit after stop", None
     if _stop.is_set() and stopped_by == "exited":
         stopped_by = "batch_stop"
     if iid in _scaled_down and stopped_by == "exited":
@@ -251,7 +309,7 @@ def run_item(item: dict, cfg: dict, model_cfg: dict, model_out: Path) -> dict:
     results = item_root / "results" / iid
     exit_file = item_root / "traces" / "log" / f"{iid}.exit"
     record.update({
-        "finished_at": rb.utc_stamp(), "elapsed_s": round(elapsed, 1), "exit_code": proc.returncode,
+        "finished_at": rb.utc_stamp(), "elapsed_s": round(elapsed, 1), "exit_code": exit_code,
         "stopped_by": stopped_by, "claude_exit": exit_file.read_text().strip() if exit_file.is_file() else None,
         "proxy_not_ready": rb.PROXY_NOT_READY_MARKER in _read(item_root / "traces" / "log" / f"{iid}.proxy.log"),
         "docker_stderr_tail": (err or "")[-600:],
@@ -306,7 +364,7 @@ def _du(path: Path) -> int:
 
 
 def main() -> int:
-    global IMAGE, GOAL_TEMPLATE
+    global IMAGE, GOAL_TEMPLATE, DETACH, BATCH, LABEL
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", required=True)
     ap.add_argument("--limit", type=int, help="only the first N items")
@@ -317,6 +375,9 @@ def main() -> int:
     GOAL_TEMPLATE = (REPO / cfg["goal_template"]).read_text(encoding="utf-8")
     model_out = Path(cfg["output_base"]) / SCAFFOLD / model_cfg["model_name"]
     model_out.mkdir(parents=True, exist_ok=True)
+    if cfg.get("detach_on_signal"):
+        DETACH, BATCH = True, hashlib.sha1(str(model_out.resolve()).encode()).hexdigest()[:10]
+        LABEL = f"run_tasks_batch={BATCH}"
     if cfg.get("npm_cache_dir"):
         Path(cfg["npm_cache_dir"]).mkdir(parents=True, exist_ok=True)
         os.chmod(cfg["npm_cache_dir"], 0o777)
@@ -341,6 +402,10 @@ def main() -> int:
     REGISTRY = Registry(model_cfg["anthropic_base_url"].rstrip("/") + "/health")
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGUSR1, on_signal)
+    adopted = {}
+    if DETACH:
+        adopted = {i: c for i, c in find_containers().items() if i in {x["id"] for x in items}}
+        log.info(f"re-adopting {len(adopted)} container(s): {', '.join(f'{i} ({c[1]})' for i, c in adopted.items())}")
     manifest = {"created_at": rb.utc_stamp(), "argv": sys.argv, "host": socket.gethostname(),
                 "repo_commit": rb._cmd_out(["git", "-C", str(REPO), "rev-parse", "HEAD"]),
                 "repo_dirty": bool(rb._cmd_out(["git", "-C", str(REPO), "status", "--porcelain"])),
@@ -358,7 +423,10 @@ def main() -> int:
         pending = {}                     # future -> item id
         by_id = {i["id"]: i for i in items}
         launched = []                    # running item ids, oldest first
-        queue = collections.deque(items)
+        queue = collections.deque(i for i in items if i["id"] not in adopted)
+        for iid, (cname, _state) in adopted.items():
+            pending[pool.submit(run_item, by_id[iid], cfg, model_cfg, model_out, cname)] = iid
+            launched.append(iid)
         stopped_cleanup, shown = False, None
         while True:
             target = target_concurrency(cfg)
@@ -385,6 +453,8 @@ def main() -> int:
                 pending[pool.submit(run_item, nxt, cfg, model_cfg, model_out)] = nxt["id"]
                 launched.append(nxt["id"])
                 time.sleep(cfg.get("launch_interval_s", 3))
+            if DETACH and _stop.is_set():
+                break                  # item threads see _stop and return; containers stay up for the next runner
             if _stop.is_set() and not stopped_cleanup:
                 stop_containers()      # also what was launched between the signal and the check above
                 stopped_cleanup = True
