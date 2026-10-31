@@ -21,7 +21,10 @@ def main() -> int:
     video = results / "whitebox.mp4"
     if not video.is_file() or video.stat().st_size < 10_000:
         missing.append("whitebox.mp4 (needs >= 10000 bytes)")
-    source_files = list(scene.glob("*.ts")) + list(scene.glob("*.js")) + list(scene.glob("*.mjs"))
+    # rglob: real source lives under scene/src/**, not directly in scene/. Exclude node_modules,
+    # which otherwise satisfies this check with dependency files and defeats its purpose.
+    source_files = [p for pat in ("*.ts", "*.js", "*.mjs") for p in scene.rglob(pat)
+                     if "node_modules" not in p.parts]
     if not source_files:
         missing.append("scene source (*.ts/*.js/*.mjs)")
     if not missing:

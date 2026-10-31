@@ -42,8 +42,10 @@ def main() -> int:
     deliverables = all((results / n).is_file() and (results / n).stat().st_size >= s for n, s in required.items())
     if deliverables and os.environ.get("M2T_DELIVERABLE_MODE") == "core_whitebox":
         scene = Path(os.environ.get("M2T_SCENE_DIR", "/home/node/project/scene"))
-        deliverables = any(path.is_file() for pattern in ("*.ts", "*.js", "*.mjs")
-                           for path in scene.glob(pattern))
+        # rglob, excluding node_modules: real source lives under scene/src/**, not directly in scene/.
+        deliverables = any(path.is_file() and "node_modules" not in path.parts
+                           for pattern in ("*.ts", "*.js", "*.mjs")
+                           for path in scene.rglob(pattern))
     previous = [json.loads(l) for l in Path(outcomes).read_text().splitlines()] if Path(outcomes).is_file() else []
 
     if deliverables:
