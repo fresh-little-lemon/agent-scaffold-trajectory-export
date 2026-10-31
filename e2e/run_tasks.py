@@ -320,7 +320,10 @@ def run_item(item: dict, cfg: dict, model_cfg: dict, model_out: Path, adopt: str
     outcomes = item_root / "traces" / "log" / f"{iid}.outcomes.jsonl"
     record["attempts"] = [json.loads(l) for l in _read(outcomes).splitlines() if l.strip()]
     decision = (record["claude_exit"] or "").strip()
-    if record["whitebox_s"] and decision == "success":
+    # whitebox_s is independently verified (ffprobe decoded the file); that is a stronger signal than the
+    # container's own self-reported exit word, which is never written if the container was killed externally
+    # (watchdog, timeout, scale-down) after it had already produced a valid deliverable.
+    if record["whitebox_s"]:
         record["status"] = "success"
     elif stopped_by in ("hung", "timeout", "batch_stop", "scaled_down"):
         record["status"] = stopped_by
