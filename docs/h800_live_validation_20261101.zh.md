@@ -81,3 +81,31 @@ daemon 上跑过)。用一个真实 warehouse 条目(`BV1Cu4y1B7Rs_p1`,来自
   `/share2/dataset/media2threejs-warehouse/lists/whole_video_triage_pass.jsonl`
   (23,092 行,1483.5 小时),不要沿用旧的 chem_test10/chem_videos 条目文件。
 - docker0 网桥消失的根因未查,如果再次复现要留意。
+
+## 5. 16 并发(cpus_per_item=6)下的"CPU 争用"排查:不是核数不够,是容器内线程池没按配额设
+
+跑了两个 16 并发的真实试点批次(每台机 16 个真实 warehouse 条目,`cpus_per_item=6`)后,
+`uptime` 显示 load average 一度到 **819**(192 核的机器),看起来像严重争用。但 `top` 同时
+显示 `%Cpu(s): 49.1 us ... 49.2 id`——**实际 CPU 使用率只有约 49%,一半是空的**。
+
+真正原因:`docker inspect` 确认每个容器的 `--cpus 6` 配额(cgroup NanoCpus)确实在生效,
+但容器里的 OCR/帧分析/ffmpeg 这类工具(用到 OpenCV、NumPy、OpenBLAS 等库)默认会读**宿主机**
+的 CPU 核数(192)来决定开多少线程,而不是容器的 cgroup 配额(6)。于是每个容器内部有远超
+6 个的线程在抢那 6 个核,被 cgroup CFS 配额持续限流——这些线程处于"可运行但在等下一个配额
+周期"的状态,会被内核计入 load average(`/proc/loadavg` 第四个字段当时是 `3115 个可运行线程
+/ 33723 个总任务`),但并不代表真的需要那么多核,也不代表 CPU 已经跑满。
+
+**这是容器内部的线程抢占/抖动,不是主机级别的核数不够。** 修复:给 `claude_env` 加上
+`OMP_NUM_THREADS/OPENBLAS_NUM_THREADS/MKL_NUM_THREADS/NUMEXPR_NUM_THREADS/OPENCV_NUM_THREADS/
+VECLIB_MAXIMUM_THREADS=6`(和 `cpus_per_item` 对齐),让这些库的线程池大小匹配实际配额,
+减少无意义的线程抖动。已经对两个试点批次的配置生效(仅影响重启后新接的条目,已在跑的 32 个
+容器不受影响,按 detach 机制安全重启验证过不会丢进度)。
+
+**另一个观察,未深挖:** `ps -eo stat` 当时统计到 4300+ 个僵尸进程(`Z`/`ZN` 状态)。
+不在 D(磁盘等待)状态里排队,所以不是 NFS I/O 造成 load average 虚高的原因;
+本机已运行 99 天,僵尸堆积的根因可能和今晚的工作无关(也可能是之前 PD 容器清理时反复遇到
+"zombie, can not be killed" 的残留),未进一步排查,留给后续关注,暂不影响任务本身。
+
+**对"docker 调度优化"的结论:** 加大 `cpus_per_item` 本身不是最优修复(容器内工具不感知
+cgroup 配额,给更多核只是推迟而非解决线程抖动);真正该做的是让容器内工具的线程池大小
+匹配分配到的核数。生产配置之后应该把这几个线程数环境变量作为默认项,而不是每次临时加。
