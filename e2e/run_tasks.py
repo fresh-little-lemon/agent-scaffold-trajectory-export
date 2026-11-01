@@ -388,8 +388,15 @@ def main() -> int:
         DETACH, BATCH = True, hashlib.sha1(str(model_out.resolve()).encode()).hexdigest()[:10]
         LABEL = f"run_tasks_batch={BATCH}"
     if cfg.get("npm_cache_dir"):
-        Path(cfg["npm_cache_dir"]).mkdir(parents=True, exist_ok=True)
-        os.chmod(cfg["npm_cache_dir"], 0o777)
+        npm_cache_dir = Path(cfg["npm_cache_dir"])
+        npm_cache_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(npm_cache_dir, 0o777)
+        except PermissionError:
+            # chmod requires file ownership (or root); a non-root runner (e.g. zlnn) hits this on a dir
+            # another user already created and left world-writable -- that's the state we want, so skip.
+            if not os.access(npm_cache_dir, os.R_OK | os.W_OK | os.X_OK):
+                raise
     items = [json.loads(line) for line in Path(cfg["items"]).read_text(encoding="utf-8").splitlines() if line.strip()]
     if args.limit:
         items = items[:args.limit]
