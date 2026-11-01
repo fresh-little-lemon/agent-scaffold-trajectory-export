@@ -110,7 +110,7 @@ def render_goal(template: str, item: dict, model: str, timeout_s: int = 5400) ->
 
 
 def container_command(item: dict, model: str, upstream: str, skill: str, extra_flags: str = "",
-                      max_resumes: int = 5, continue_session: bool = False) -> str:
+                      max_resumes: int = 5, continue_session: bool = False, cpus_per_item: int = 6) -> str:
     """Prepare the input, then run Claude in an attempt loop.
 
     Attempt 1 starts the session with the /goal; later attempts resume the same session (`--continue`) and set
@@ -121,9 +121,11 @@ def container_command(item: dict, model: str, upstream: str, skill: str, extra_f
     iid = item["id"]
     log_dir = f"{out}/traces/log"
     stream = f"{log_dir}/{iid}.claude.stream.jsonl"
+    # ffmpeg's own thread pool defaults to probing the host's core count (-threads 0), not the container's
+    # cgroup quota, which thrashes the same way the numeric libraries did (see OMP_NUM_THREADS etc. below).
     clip = (f"ffmpeg -nostdin -loglevel error -y -ss {float(item.get('clip_start', 0))} "
             f"-t {float(item['clip_seconds'])} -i /data/input/source.mp4 -an -c:v libx264 -preset veryfast "
-            f"-crf 20 -pix_fmt yuv420p /home/node/project/input/{iid}.mp4")
+            f"-threads {cpus_per_item} -crf 20 -pix_fmt yuv420p /home/node/project/input/{iid}.mp4")
     claude = f"claude --dangerously-skip-permissions {extra_flags}--output-format stream-json --verbose"
     return (
         "umask 0000 && "
@@ -207,6 +209,9 @@ def build_container(item: dict, cfg: dict, model_cfg: dict, model_out: Path) -> 
     if cfg.get("autocompact_pct") is not None:
         env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] = str(cfg["autocompact_pct"])
     env["M2T_RESULTS_DIR"] = f"/app/outputs/{SCAFFOLD}/{model}/results/{iid}"
+    # Any ffmpeg/rendering call the skill itself makes should size its own thread pool off this, not the
+    # host's core count -- same class of cgroup-quota-blind thread pool as OMP_NUM_THREADS etc. below.
+    env["FFMPEG_THREADS"] = env["M2T_CPUS_PER_ITEM"] = str(cfg.get("cpus_per_item", 6))
     env.update(rb.build_claude_code_env(model, model_cfg.get("api_key", "EMPTY"),
                                         f"http://127.0.0.1:{rb.IN_CONTAINER_PROXY_PORT}", cfg.get("claude_env")))
     if cfg.get("deliverable_mode") == "core_whitebox":
@@ -228,7 +233,8 @@ def build_container(item: dict, cfg: dict, model_cfg: dict, model_out: Path) -> 
            *(["-v", f"{(REPO / cfg['stop_hook']).parent}:/opt/hooks:ro"] if cfg.get("stop_hook") else []),
            IMAGE, "bash", "-c", container_command(item, model, upstream, cfg.get("skill", "media2threejs"),
                                                   f"--effort {cfg['effort']} " if cfg.get("effort") else "",
-                                                  cfg.get("max_resumes", 5), continue_session)]
+                                                  cfg.get("max_resumes", 5), continue_session,
+                                                  cfg.get("cpus_per_item", 6))]
     return cmd, continue_session
 
 
